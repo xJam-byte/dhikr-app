@@ -1,0 +1,68 @@
+# --- Node & workspaces ---
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Env ---
+.env
+.env.*
+**/.env
+**/.env.*
+
+# --- Expo / React Native ---
+.expo/
+.expo-shared/
+*.keystore
+*.jks
+*.p8
+*.p12
+*.mobileprovision
+*.ipa
+*.apk
+*.aab
+
+# Если позже сгенерируешь нативные папки (prebuild), их тоже игнорим:
+android/
+ios/
+
+# --- Builds / bundles / caches ---
+dist/
+**/dist/
+build/
+**/build/
+coverage/
+.turbo/
+.expo/*
+expo-build/
+*.map
+
+# --- Uploads (аудио и пр.) ---
+uploads/
+**/uploads/
+**/uploads/**
+
+# --- Python (apps/py_asr) ---
+apps/py_asr/.venv/
+apps/py_asr/venv/
+apps/py_asr/__pycache__/
+apps/py_asr/.mypy_cache/
+apps/py_asr/.pytest_cache/
+apps/py_asr/.ruff_cache/
+apps/py_asr/.ipynb_checkpoints/
+apps/py_asr/models/
+apps/py_asr/downloads/
+apps/py_asr/*.onnx
+apps/py_asr/*.pt
+apps/py_asr/*.bin
+apps/py_asr/*.tflite
+
+# --- DB / OS junk ---
+*.sqlite
+*.db
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini

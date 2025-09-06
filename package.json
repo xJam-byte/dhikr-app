@@ -1,0 +1,17 @@
+{
+  "name": "dhikr_app",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:mobile": "npm exec -w mobile expo start",
+    "dev:api": "npm run start:dev --workspace=api",
+    "dev:worker": "npm run start --workspace=worker"
+  },
+  "devDependencies": {
+    "@types/luxon": "^3.7.1"
+  },
+  "dependencies": {}
+}

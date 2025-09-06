@@ -1,0 +1,140 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "windows"]
+}
+
+enum UserLevel {
+  BEGINNER
+  ADVANCED
+}
+
+enum RecordingStatus {
+  QUEUED
+  PROCESSING
+  DONE
+  FAILED
+}
+model User {
+  id            String         @id @default(uuid())
+  email         String?        @unique
+  passwordHash  String?
+  deviceId      String?        @unique   // 👉 новый уникальный идентификатор устройства
+  language      String         @default("ru")
+  level         UserLevel      @default(BEGINNER)
+  timezone      String?        @default("UTC")
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  recordings    Recording[]
+  dailyCounters DailyCounter[]
+  total         TotalCounter?
+}
+
+
+
+model Zikr {
+  id           String        @id @default(uuid())
+  arabicText   String
+  translit     String
+  category     String?       // "morning" | "evening" | "tasbih"
+  target       Int?          // кол-во повторов по умолчанию
+  createdAt    DateTime      @default(now())
+  translations Translation[]
+  recordings   Recording[]
+  variants     ZikrVariant[]
+}
+
+
+
+model Translation {
+  id        String   @id @default(uuid())
+  zikrId    String
+  zikr      Zikr     @relation(fields: [zikrId], references: [id])
+  lang      String   // ru, kz, en
+  text      String   // перевод
+  createdAt DateTime @default(now())
+
+  @@unique([zikrId, lang])
+}
+
+model Recording {
+  id          String          @id @default(uuid())
+  userId      String
+  user        User            @relation(fields: [userId], references: [id])
+  zikrId      String
+  zikr        Zikr            @relation(fields: [zikrId], references: [id])
+  filename    String
+  durationMs  Int?
+  sizeBytes   Int?
+  checksum    String          @unique
+  createdAt   DateTime        @default(now())
+  status      RecordingStatus @default(QUEUED)
+  text        String?
+  score       Float?
+  processedAt DateTime?
+  dailyCounterId String?
+  DailyCounterEntry DailyCounter? @relation(fields: [dailyCounterId], references: [id])
+}
+
+model DailyCounter {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  date      DateTime // лучше хранить UTC
+  count     Int      @default(0)
+  recordings Recording[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, date])
+}
+
+model TotalCounter {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  total     Int      @default(0)
+  updatedAt DateTime @updatedAt
+}
+
+enum VariantScript {
+  AR
+  LATIN
+  RU
+}
+model ZikrVariant {
+  id         String         @id @default(uuid())
+  zikrId     String
+  zikr        Zikr            @relation(fields: [zikrId], references: [id])
+  script     VariantScript
+  lang       String
+  textRaw    String
+  textNorm   String
+  anchors    String[]       @default([])
+  priority   Int            @default(0)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  @@unique([zikrId, script, textNorm]) // <-- композитный уникальный
+  @@index([zikrId])
+}
+
+
+model UserZikrDaily {
+  id         String   @id @default(uuid())
+  userId     String
+  zikrId     String
+  date       DateTime
+  count      Int      @default(0)
+  target     Int      @default(33)
+  completed  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([userId, zikrId, date])
+  @@index([userId, date])
+}
