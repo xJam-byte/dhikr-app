@@ -1,6 +1,7 @@
 // apps/mobile/components/AutoRecorder.js
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Audio } from "expo-av";
+import { Audio, InterruptionModeIOS, InterruptionModeAndroid } from "expo-av";
+
 import * as FileSystem from "expo-file-system";
 import { Platform } from "react-native";
 import API from "../api";
@@ -12,21 +13,46 @@ const VAD = {
   silenceMs: 800,
   maxChunkMs: 6000,
   minVoiceStreakMs: 120,
-  progressUpdateMs: 120, // <<< важно для Recording.setProgressUpdateInterval
-  postSuccessMuteMs: 1200, // «тишинное» окно после успешной фразы
-  idleStopMs: 4500, // автоостановка по тишине
+  progressUpdateMs: 120,
+  postSuccessMuteMs: 1200,
+  idleStopMs: 4500,
 };
 
 let postSuccessMuteUntil = 0;
 
-async function configureAudio() {
-  const perm = await Audio.requestPermissionsAsync();
-  if (!perm.granted) throw new Error("no-mic-permission");
+// ---- helpers: пермишены и аудио-сессия (основная/запасная)
+async function ensureMicPermission() {
+  const cur = await Audio.getPermissionsAsync();
+  if (cur.status === "granted" || cur.granted) return;
+  if (cur.canAskAgain) {
+    const req = await Audio.requestPermissionsAsync();
+    if (req.status === "granted" || req.granted) return;
+  }
+  throw new Error("no-mic-permission");
+}
+
+async function setAudioModePrimary() {
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: true,
     playsInSilentModeIOS: true,
     staysActiveInBackground: false,
-    interruptionModeIOS: 2,
+    interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+    interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+    shouldDuckAndroid: true,
+    playThroughEarpieceAndroid: false,
+  });
+}
+
+async function setAudioModeFallback() {
+  await Audio.setAudioModeAsync({
+    allowsRecordingIOS: true,
+    playsInSilentModeIOS: true,
+    staysActiveInBackground: false,
+    // иногда MIX_WITH_OTHERS помогает, когда iOS говорит "not allowed"
+    interruptionModeIOS: InterruptionModeIOS.MixWithOthers,
+    interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+    shouldDuckAndroid: true,
+    playThroughEarpieceAndroid: false,
   });
 }
 
@@ -82,7 +108,7 @@ export default function useAutoRecorder(zikrId, onChunkDone) {
     const rec = recRef.current;
     if (!rec) return;
 
-    // защитимся от двойного вызова
+    // остановить колбэки статуса перед выгрузкой
     detachStatus();
 
     let uri = null;
@@ -102,10 +128,9 @@ export default function useAutoRecorder(zikrId, onChunkDone) {
     const hadVoiceMs = voiceMsRef.current;
     voiceMsRef.current = 0;
 
-    // если цикл остановлен — выключим индикаторы
     if (!loopRef.current) setActive(false);
 
-    // фильтрация пустых чанков
+    // отбрасываем пустые/короткие чанки
     if (
       !uri ||
       durationMs < VAD.minSpeechMs ||
@@ -134,7 +159,7 @@ export default function useAutoRecorder(zikrId, onChunkDone) {
         timeout: 20000,
       });
 
-      // успешная загрузка → тишинное окно
+      // успешная загрузка → mute-окно
       postSuccessMuteUntil = Date.now() + VAD.postSuccessMuteMs;
 
       onChunkDone?.(res.data);
@@ -181,35 +206,49 @@ export default function useAutoRecorder(zikrId, onChunkDone) {
 
       // автостоп по долгой тишине
       if (!speaking && now - lastAnyVoiceAtRef.current > VAD.idleStopMs) {
-        // не await внутри callback
         setTimeout(() => stop(), 0);
         return;
       }
 
       const silence = now - lastVoiceAtRef.current;
 
-      // финализация, если вышли из mute-окна
+      // финализируем фрагмент, если вышли из mute-окна
       if (
         !inMuteWindow &&
         dur >= VAD.minSpeechMs &&
         (silence >= VAD.silenceMs || dur >= VAD.maxChunkMs)
       ) {
-        // не await внутри callback
         setTimeout(() => finalizeChunk(), 0);
       }
     });
     statusAttachedRef.current = true;
   }, [finalizeChunk]);
 
+  // ВАЖНО: возвращает true/false — удалось ли реально стартануть
   async function startNewRecording() {
-    if (startingRef.current) return;
+    if (startingRef.current) return false;
     startingRef.current = true;
     try {
-      if (!loopRef.current) return;
+      await ensureMicPermission();
+      try {
+        await setAudioModePrimary();
+      } catch {}
 
-      await configureAudio();
       const opts = makeOptions();
-      const { recording } = await Audio.Recording.createAsync(opts);
+
+      let recording;
+      try {
+        ({ recording } = await Audio.Recording.createAsync(opts));
+      } catch (e1) {
+        // fallback-сессия + ретрай, если устройство «не пускает»
+        try {
+          await setAudioModeFallback();
+          ({ recording } = await Audio.Recording.createAsync(opts));
+        } catch (e2) {
+          console.log("[rec] start error", e2?.message || e1?.message);
+          return false;
+        }
+      }
 
       recRef.current = recording;
 
@@ -219,24 +258,27 @@ export default function useAutoRecorder(zikrId, onChunkDone) {
       lastAnyVoiceAtRef.current = now;
       voiceMsRef.current = 0;
 
-      setActive(true);
       attachStatus();
+      setActive(true); // включаем только после успешного createAsync
+      return true;
     } catch (e) {
-      loopRef.current = false;
-      setActive(false);
-      console.log("[rec] start error", e?.message);
+      console.log("[rec] start error outer", e?.message);
+      return false;
     } finally {
       startingRef.current = false;
     }
   }
 
+  // НЕ включаем active/loopRef заранее — ждём реального успеха
   const start = useCallback(async () => {
-    if (loopRef.current) return;
-    loopRef.current = true;
-    setActive(true);
-    // сбросим «тишинное окно» при старте
+    if (startingRef.current || loopRef.current) return;
     postSuccessMuteUntil = 0;
-    await startNewRecording();
+
+    const ok = await startNewRecording();
+    if (ok) {
+      // только теперь включаем цикловой режим (для авто-чанков)
+      loopRef.current = true;
+    }
   }, []);
 
   const stop = useCallback(async () => {

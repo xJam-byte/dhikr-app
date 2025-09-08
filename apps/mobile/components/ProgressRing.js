@@ -1,16 +1,19 @@
 import React from "react";
 import Svg, { Circle } from "react-native-svg";
+import { colors } from "../theme/tokens";
 
 export default function ProgressRing({
   size = 52,
-  stroke = 6,
+  stroke = 8,
   progress = 0,
-  track = "#E5E7EB",
-  color = "#0EA5A4",
+  track = colors.border,
+  color = colors.primary,
 }) {
+  const clamped = Math.min(Math.max(progress, 0), 1);
   const r = (size - stroke) / 2;
   const c = 2 * Math.PI * r;
-  const offset = c - Math.min(Math.max(progress, 0), 1) * c;
+  const offset = c - clamped * c;
+
   return (
     <Svg width={size} height={size}>
       <Circle

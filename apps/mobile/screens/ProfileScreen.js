@@ -1,10 +1,17 @@
+// apps/mobile/screens/ProfileScreen.js
 import React, { useEffect, useState } from "react";
-import { View, Text, StyleSheet, TouchableOpacity, Alert } from "react-native";
+import { View, Text, StyleSheet, Alert } from "react-native";
 import { colors, radii, spacing, shadow } from "../theme/tokens";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import API from "../api";
 import { useAppLang } from "../hooks/useAppLang";
 import { useTranslation } from "react-i18next";
+
+// UI
+import AppHeader from "../components/AppHeader";
+import CounterPill from "../components/CounterPill";
+import Chip from "../components/Chip";
+import PrimaryButton from "../components/PrimaryButton";
 
 export default function ProfileScreen() {
   const [stats, setStats] = useState({ todayCount: 0, totalCount: 0 });
@@ -17,8 +24,10 @@ export default function ProfileScreen() {
   async function load() {
     try {
       const r = await API.get("/counters/today");
-      setStats(r.data);
-    } catch {}
+      setStats(r.data || { todayCount: 0, totalCount: 0 });
+    } catch {
+      // молча — визуально покажем 0/0
+    }
   }
 
   async function resetTodayLocal() {
@@ -27,23 +36,33 @@ export default function ProfileScreen() {
       d.getMonth() + 1
     ).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
     await AsyncStorage.removeItem(k);
-    Alert.alert("Готово", "Локальный прогресс на сегодня очищен.");
+    Alert.alert(
+      t("done") || "Готово",
+      t("resetLocalDone") || "Локальный прогресс на сегодня очищен."
+    );
   }
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>{t("profile")}</Text>
+      <AppHeader title={t("profile")} />
 
+      {/* Статистика */}
       <View style={[styles.card, shadow.card]}>
-        <Text style={styles.statTitle}>{t("today")}</Text>
-        <Text style={styles.statValue}>{stats.todayCount}</Text>
-        <Text style={styles.statTitle}>{t("total")}</Text>
-        <Text style={styles.statValue}>{stats.totalCount}</Text>
+        <Text style={styles.section}>{t("today")}</Text>
+        <View style={styles.rowGap}>
+          <CounterPill
+            label={t("today")}
+            value={stats.todayCount}
+            tone="success"
+          />
+          <CounterPill label={t("total")} value={stats.totalCount} />
+        </View>
       </View>
 
+      {/* Уровень и язык */}
       <View style={[styles.card, shadow.card]}>
         <Text style={styles.section}>{t("level")}</Text>
-        <View style={styles.row}>
+        <View style={styles.rowChips}>
           <StaticTag label={t("beginner")} active />
           <StaticTag label={t("advanced")} />
         </View>
@@ -51,33 +70,28 @@ export default function ProfileScreen() {
         <Text style={[styles.section, { marginTop: spacing.lg }]}>
           {t("language")}
         </Text>
-        <View style={styles.row}>
-          <LangTag
+        <View style={styles.rowChips}>
+          <Chip
             label="Рус"
-            value="ru"
             active={lang === "ru"}
-            onPress={setLang}
+            onPress={() => setLang("ru")}
           />
-          <LangTag
+          <Chip
             label="Қаз"
-            value="kz"
             active={lang === "kz"}
-            onPress={setLang}
+            onPress={() => setLang("kz")}
           />
-          <LangTag
+          <Chip
             label="Eng"
-            value="en"
             active={lang === "en"}
-            onPress={setLang}
+            onPress={() => setLang("en")}
           />
         </View>
       </View>
 
-      <TouchableOpacity onPress={resetTodayLocal} style={styles.resetBtn}>
-        <Text style={{ color: "#fff", fontWeight: "800" }}>
-          {t("resetLocal")}
-        </Text>
-      </TouchableOpacity>
+      <PrimaryButton onPress={resetTodayLocal} style={styles.resetBtn}>
+        {t("resetLocal")}
+      </PrimaryButton>
     </View>
   );
 }
@@ -92,29 +106,13 @@ function StaticTag({ label, active }) {
   );
 }
 
-function LangTag({ label, value, active, onPress }) {
-  return (
-    <TouchableOpacity onPress={() => onPress(value)}>
-      <View style={[styles.tag, active && styles.tagActive]}>
-        <Text style={[styles.tagTxt, active && styles.tagTxtActive]}>
-          {label}
-        </Text>
-      </View>
-    </TouchableOpacity>
-  );
-}
-
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: spacing.lg,
-    backgroundColor: colors.surfaceMuted,
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: "800",
-    color: colors.text,
-    marginTop: spacing.lg,
+    backgroundColor: colors.bg,
+    paddingHorizontal: spacing.lg,
+    paddingTop: 30,
+    paddingBottom: spacing.xxl,
   },
   card: {
     backgroundColor: colors.surface,
@@ -124,15 +122,28 @@ const styles = StyleSheet.create({
     padding: spacing.lg,
     marginTop: spacing.lg,
   },
-  statTitle: { color: colors.textMuted, marginTop: spacing.sm },
-  statValue: { fontSize: 28, fontWeight: "800", color: colors.text },
-  section: { fontSize: 16, fontWeight: "800", color: colors.text },
-  row: { flexDirection: "row", gap: 8, marginTop: spacing.sm },
+  section: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: colors.text,
+    marginBottom: spacing.sm,
+  },
+  rowGap: { flexDirection: "row", gap: spacing.sm, alignItems: "center" },
+  rowChips: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+    flexWrap: "wrap",
+  },
+
+  // статичные теги уровня
   tag: {
     paddingHorizontal: spacing.md,
     paddingVertical: 8,
     borderRadius: radii.pill,
     backgroundColor: "#EEF2F7",
+    borderWidth: 1,
+    borderColor: colors.border,
   },
   tagActive: {
     backgroundColor: "#DFF7F6",
@@ -141,11 +152,8 @@ const styles = StyleSheet.create({
   },
   tagTxt: { color: colors.textMuted, fontWeight: "700" },
   tagTxtActive: { color: colors.primaryDark },
+
   resetBtn: {
-    backgroundColor: colors.primary,
-    borderRadius: radii.md,
-    alignItems: "center",
-    paddingVertical: 14,
     marginTop: spacing.xl,
   },
 });

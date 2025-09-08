@@ -1,29 +1,37 @@
 import React from "react";
 import { View, Text, StyleSheet } from "react-native";
-import { colors, spacing } from "../theme/tokens";
 import { Ionicons } from "@expo/vector-icons";
+import { colors, spacing, radii, shadow } from "../theme/tokens";
 
 export default function AppHeader({ title, right }) {
   return (
-    <View style={styles.wrap}>
-      <View style={{ width: 28 }} />
-      <Text numberOfLines={1} style={styles.title}>
+    <View style={styles.container}>
+      <Text style={styles.title} numberOfLines={1}>
         {title}
       </Text>
-      <View style={styles.right}>{right}</View>
+      {!!right && <View style={styles.right}>{right}</View>}
     </View>
   );
 }
 const styles = StyleSheet.create({
-  wrap: {
-    paddingTop: 16,
-    paddingBottom: spacing.md,
-    paddingHorizontal: spacing.lg,
+  right: { width: 28, alignItems: "flex-end" },
+  container: {
     backgroundColor: colors.surface,
+    paddingHorizontal: spacing.xl,
+    paddingTop: spacing.xl,
+    paddingBottom: spacing.lg,
+    borderBottomColor: colors.border,
+    marginTop: 30,
+    borderBottomWidth: StyleSheet.hairlineWidth,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
+    ...shadow.card,
   },
-  title: { fontSize: 22, fontWeight: "800", color: colors.text },
-  right: { width: 28, alignItems: "flex-end" },
+  title: {
+    flex: 1,
+    fontSize: 20,
+    fontWeight: "700",
+    color: colors.text,
+  },
+  right: { marginLeft: spacing.lg },
 });

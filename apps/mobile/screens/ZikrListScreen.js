@@ -20,15 +20,15 @@ import useZikrProgress from "../hooks/useZikrProgress";
 import { useAppLang } from "../hooks/useAppLang";
 import { useTranslation } from "react-i18next";
 import { toTransMap } from "../utils/zikrText";
+import AnimatedCard from "../components/AnimatedCard";
 
 const CATEGORIES = [
   { key: "all", labelI18n: "all", fallback: "Все" },
   { key: "morning", labelI18n: "morning", fallback: "Утро" },
   { key: "evening", labelI18n: "evening", fallback: "Вечер" },
-  { key: "tasbih", labelI18n: "tasbih", fallback: "Тасбих" }, // ← канонический ключ
+  { key: "tasbih", labelI18n: "tasbih", fallback: "Тасбих" },
 ];
 
-// мапа синонимов/опечаток в каноническое имя категории
 const CAT_SYNONYM = {
   tasbeeh: "tasbih",
   tasbeeḥ: "tasbih",
@@ -41,7 +41,7 @@ const CAT_SYNONYM = {
 const normalizeCatRaw = (v) => (v || "").toLowerCase().trim();
 const toCanonicalCat = (v) => {
   const n = normalizeCatRaw(v);
-  return CAT_SYNONYM[n] || n; // если нет в словаре — оставим как есть
+  return CAT_SYNONYM[n] || n;
 };
 
 export default function ZikrListScreen({ navigation }) {
@@ -49,7 +49,7 @@ export default function ZikrListScreen({ navigation }) {
   const [counts, setCounts] = useState({ todayCount: 0, totalCount: 0 });
   const [refreshing, setRefreshing] = useState(false);
   const [q, setQ] = useState("");
-  const [cat, setCat] = useState("all"); // активная категория в UI
+  const [cat, setCat] = useState("all");
   const pagerRef = useRef(null);
   const { width } = useWindowDimensions();
 
@@ -62,7 +62,6 @@ export default function ZikrListScreen({ navigation }) {
       API.get("/zikr?limit=200"),
       API.get("/counters/today"),
     ]);
-    // сразу нормализуем category на клиенте (не ломая БД)
     const items = (z.data.items || []).map((it) => ({
       ...it,
       category: toCanonicalCat(it.category),
@@ -76,7 +75,6 @@ export default function ZikrListScreen({ navigation }) {
     load();
   }, []);
 
-  // фильтр по поиску и категории
   const filterBy = (catKey) => {
     const term = q.trim().toLowerCase();
     return (list || []).filter((item) => {
@@ -101,12 +99,11 @@ export default function ZikrListScreen({ navigation }) {
     });
   };
 
-  // данные для каждой "страницы" (категории)
   const dataByCat = {
     all: useMemo(() => filterBy("all"), [list, q, lang]),
     morning: useMemo(() => filterBy("morning"), [list, q, lang]),
     evening: useMemo(() => filterBy("evening"), [list, q, lang]),
-    tasbih: useMemo(() => filterBy("tasbih"), [list, q, lang]), // ← фикс ключа
+    tasbih: useMemo(() => filterBy("tasbih"), [list, q, lang]),
   };
 
   const onRefresh = async () => {
@@ -115,7 +112,6 @@ export default function ZikrListScreen({ navigation }) {
     setRefreshing(false);
   };
 
-  // синхронизация свайпа -> активный чип
   const onMomentumEnd = (e) => {
     const x = e.nativeEvent.contentOffset.x;
     const idx = Math.round(x / width);
@@ -123,14 +119,11 @@ export default function ZikrListScreen({ navigation }) {
     if (nextCat !== cat) setCat(nextCat);
   };
 
-  // синхронизация чипа -> скролл к странице
   const scrollToCat = (key) => {
     const idx = CATEGORIES.findIndex((c) => c.key === key);
     if (idx < 0) return;
     setCat(key);
-    if (pagerRef.current) {
-      pagerRef.current.scrollTo({ x: idx * width, animated: true });
-    }
+    pagerRef.current?.scrollTo({ x: idx * width, animated: true });
   };
 
   const renderPage = (catKey) => (
@@ -138,36 +131,30 @@ export default function ZikrListScreen({ navigation }) {
       <FlatList
         contentContainerStyle={styles.listContent}
         data={dataByCat[catKey]}
-        keyExtractor={(item) => item.id}
+        keyExtractor={(item, i) => item?.id || `${catKey}-${i}`}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
         }
-        renderItem={({ item }) => {
-          const target = item.target || 33;
+        renderItem={({ item, index }) => {
+          const target = item.target ?? 33;
           const prog = getProgress(item.id);
           return (
-            <ZikrCard
-              item={item}
-              progress={prog}
-              target={target}
-              // будет видно, что «одинаковые по тексту» — разные,
-              // если в карточке показать бейдж категории и цифру цели
-              onPress={() =>
-                navigation.navigate("ZikrDetail", { zikr: item, target })
-              }
-            />
+            <AnimatedCard index={index}>
+              <ZikrCard
+                item={item}
+                progress={prog}
+                target={target}
+                onPress={() =>
+                  navigation.navigate("ZikrDetail", { zikr: item, target })
+                }
+              />
+            </AnimatedCard>
           );
         }}
         ListEmptyComponent={
-          <View style={{ alignItems: "center", paddingTop: 48, gap: 6 }}>
-            <Text
-              style={{ fontSize: 16, fontWeight: "800", color: colors.text }}
-            >
-              {t("noCategoryList")}
-            </Text>
-            <Text style={{ color: colors.textMuted }}>
-              {t("tryAnotherFilter")}
-            </Text>
+          <View style={styles.empty}>
+            <Text style={styles.emptyTitle}>{t("noCategoryList")}</Text>
+            <Text style={styles.emptyCaption}>{t("tryAnotherFilter")}</Text>
           </View>
         }
       />
@@ -178,7 +165,6 @@ export default function ZikrListScreen({ navigation }) {
     <View style={styles.container}>
       <AppHeader title={t("appTitle")} />
 
-      {/* Плашки счетчиков */}
       <View style={styles.caps}>
         <CounterPill
           label={t("today")}
@@ -188,11 +174,10 @@ export default function ZikrListScreen({ navigation }) {
         <CounterPill label={t("total")} value={counts.totalCount} />
       </View>
 
-      {/* Поиск + чипы */}
       <View style={styles.filtersBlock}>
         <SearchBar
           value={q}
-          onChange={setQ}
+          onChange={setQ} // ← ключевая правка
           placeholder={t("searchPlaceholder")}
         />
         <ScrollView
@@ -212,7 +197,6 @@ export default function ZikrListScreen({ navigation }) {
         </ScrollView>
       </View>
 
-      {/* Свайпаемый пейджер по категориям */}
       <ScrollView
         ref={pagerRef}
         horizontal
@@ -228,7 +212,7 @@ export default function ZikrListScreen({ navigation }) {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.surfaceMuted },
+  container: { flex: 1, backgroundColor: colors.bg, paddingTop: 10 },
   caps: {
     flexDirection: "row",
     gap: spacing.sm,
@@ -248,4 +232,7 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.xxl,
     gap: spacing.md,
   },
+  empty: { alignItems: "center", paddingTop: 48, gap: 6 },
+  emptyTitle: { fontSize: 16, fontWeight: "800", color: colors.text },
+  emptyCaption: { color: colors.textMuted },
 });

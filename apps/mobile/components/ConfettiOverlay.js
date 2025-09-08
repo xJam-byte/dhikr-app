@@ -7,16 +7,16 @@ export default function ConfettiOverlay({ trigger }) {
   return (
     <View
       pointerEvents="none"
-      style={{ ...StyleSheet.absoluteFill, zIndex: 999 }}
+      style={{ ...StyleSheet.absoluteFillObject, zIndex: 999 }}
     >
       {trigger ? (
         <ConfettiCannon
           ref={ref}
-          fadeOut
           autoStart
-          count={160}
-          origin={{ x: 0, y: 0 }}
-          fallSpeed={3000}
+          fadeOut
+          count={60}
+          delay={120}
+          origin={{ x: -10, y: 0 }}
         />
       ) : null}
     </View>

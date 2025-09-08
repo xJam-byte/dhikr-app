@@ -1,19 +1,10 @@
-// apps/mobile/components/RecordButton.js
 import React, { useEffect, useRef } from "react";
-import {
-  Pressable,
-  View,
-  Text,
-  StyleSheet,
-  Animated,
-  Platform,
-} from "react-native";
+import { Pressable, View, Text, StyleSheet, Animated } from "react-native";
 import { colors, radii, spacing, shadow } from "../theme/tokens";
 
 export default function RecordButton({ isRecording, onPress, disabled }) {
   const pulse = useRef(new Animated.Value(1)).current;
 
-  // Пульсация при записи
   useEffect(() => {
     let loop;
     if (isRecording) {
@@ -42,14 +33,19 @@ export default function RecordButton({ isRecording, onPress, disabled }) {
   return (
     <Pressable
       accessibilityRole="button"
-      onPress={onPress}
+      accessibilityLabel={isRecording ? "Остановить запись" : "Начать запись"}
+      accessibilityHint={
+        isRecording ? "Остановит текущую запись" : "Начнёт запись зикра"
+      }
+      accessibilityState={{ disabled }}
+      onPress={disabled ? null : onPress}
       disabled={disabled}
-      hitSlop={20} // ↑ увеличивает зону касания
+      hitSlop={20}
       android_ripple={{ color: "#E5E7EB", borderless: false }}
       style={({ pressed }) => [
         styles.pressable,
         shadow.card,
-        pressed && styles.pressed, // легкий отклик при нажатии
+        pressed && styles.pressed,
         disabled && { opacity: 0.6 },
       ]}
     >

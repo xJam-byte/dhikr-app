@@ -5,6 +5,9 @@ import { colors, radii, spacing } from "../theme/tokens";
 export default function Chip({ label, active, onPress }) {
   return (
     <TouchableOpacity
+      accessibilityRole="button"
+      accessibilityState={{ selected: !!active }}
+      accessibilityLabel={`Фильтр: ${label}${active ? ", выбран" : ""}`}
       onPress={onPress}
       style={[styles.chip, active && styles.active]}
     >
@@ -12,6 +15,7 @@ export default function Chip({ label, active, onPress }) {
     </TouchableOpacity>
   );
 }
+
 const styles = StyleSheet.create({
   chip: {
     paddingHorizontal: spacing.md,
@@ -19,6 +23,8 @@ const styles = StyleSheet.create({
     backgroundColor: "#EEF2F7",
     borderRadius: radii.pill,
     marginRight: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
   },
   active: {
     backgroundColor: "#DFF7F6",

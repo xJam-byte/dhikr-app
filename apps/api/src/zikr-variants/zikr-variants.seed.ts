@@ -5,17 +5,79 @@ import { normalizeText } from "../verify/text-utils";
 const prisma = new PrismaClient();
 type Script = "AR" | "LATIN" | "RU";
 
-// Якори: убираем мусор, AR → 1 токен, прочие → до 2
+// Быстрая нормализация (опираемся на твой normalizeText)
+const norm = (s: string) => normalizeText(s || "");
+
+// LATIN: генерируем и раздельные, и слитные формы + частые биграммы
+function latinAnchors(textRaw: string): string[] {
+  const n = norm(textRaw);
+  if (!n) return [];
+  const parts = n.split(/\s+/).filter(Boolean);
+
+  const set = new Set<string>();
+
+  // одиночные слова (отбрасываем совсем короткие)
+  parts.forEach((p) => {
+    if (p.length >= 3) set.add(p);
+  });
+
+  // склейки: вся фраза слитно и соседние пары
+  if (parts.length >= 2) {
+    set.add(parts.join("")); // вся фраза слитно
+    for (let i = 0; i < parts.length - 1; i++) {
+      const a = parts[i];
+      const b = parts[i + 1];
+      if (a.length >= 2 && b.length >= 2) {
+        set.add(a + b); // subhanallah, allahuakbar, ...
+        set.add(`${a} ${b}`); // дублируем и с пробелом
+      }
+    }
+  }
+
+  // спец-кейсы распространённых форм (таухид, хамдулилля, и т.п.)
+  const tight = n.replace(/\s+/g, "");
+  if (/^lailahaill?allah$/.test(tight)) {
+    set.add("la ilaha illallah");
+    set.add("lailahaillallah");
+    set.add("illallah");
+  }
+  // hamdulillah / alhamdulillah
+  if (tight.includes("hamdulillah") || tight.includes("alhamdulillah")) {
+    set.add("hamdulillah");
+    set.add("alhamdulillah");
+  }
+  // hasbunallahu wa nimal wakil
+  if (tight.includes("hasbunallahu")) {
+    set.add("hasbunallahu");
+    set.add("hasbunallahuwanimalwakil");
+    set.add("alwakil");
+  }
+  // la hawla wa la quwwata
+  if (tight.includes("lahawla") || tight.includes("quwwata")) {
+    set.add("la hawla");
+    set.add("quwwata");
+    set.add("illa billah");
+    set.add("lahawlawalaquwwataillabillah");
+  }
+
+  // ограничим размер набора для скорости
+  return Array.from(set).slice(0, 12);
+}
+
+// AR/RU: якоря на основе токенов (1 для арабского, до 2 для кириллицы)
 function anchorsFromText(text: string, script: Script): string[] {
-  const n = normalizeText(text);
+  const n = norm(text);
+  if (!n) return [];
   let tokens = n.split(/\s+/).filter(Boolean);
 
-  // отфильтруем слишком короткие (wa, la и т.п.)
-  const strong = tokens.filter((t) => t.length >= 3);
-  if (strong.length > 0) tokens = strong;
+  // убрать совсем короткие
+  tokens = tokens.filter((t) => t.length >= 3);
+  if (!tokens.length) return [];
 
-  if (tokens.length === 0) return [];
-  return script === "AR" ? tokens.slice(0, 1) : tokens.slice(0, 2);
+  if (script === "AR") return tokens.slice(0, 1);
+  if (script === "RU") return tokens.slice(0, 2);
+  // для LATIN используем расширенный генератор
+  return latinAnchors(text);
 }
 
 export async function seedBasicVariants() {
@@ -49,7 +111,7 @@ export async function seedBasicVariants() {
 
     // AR
     if (arRaw) {
-      const textNorm = normalizeText(arRaw);
+      const textNorm = norm(arRaw);
       if (textNorm) {
         items.push({
           lang: "ar",
@@ -62,9 +124,9 @@ export async function seedBasicVariants() {
       }
     }
 
-    // LATIN (транслит из БД)
+    // LATIN (транслит)
     if (latRaw) {
-      const textNorm = normalizeText(latRaw);
+      const textNorm = norm(latRaw);
       if (textNorm) {
         items.push({
           lang: "lat",
@@ -79,7 +141,7 @@ export async function seedBasicVariants() {
 
     // EN → тоже LATIN
     if (enRaw) {
-      const textNorm = normalizeText(enRaw);
+      const textNorm = norm(enRaw);
       if (textNorm) {
         items.push({
           lang: "en",
@@ -92,9 +154,9 @@ export async function seedBasicVariants() {
       }
     }
 
-    // RU → скрипт RU
+    // RU
     if (ruRaw) {
-      const textNorm = normalizeText(ruRaw);
+      const textNorm = norm(ruRaw);
       if (textNorm) {
         items.push({
           lang: "ru",
@@ -107,9 +169,9 @@ export async function seedBasicVariants() {
       }
     }
 
-    // KZ → тоже RU (кириллица)
+    // KZ → кириллица
     if (kzRaw) {
-      const textNorm = normalizeText(kzRaw);
+      const textNorm = norm(kzRaw);
       if (textNorm) {
         items.push({
           lang: "kz",

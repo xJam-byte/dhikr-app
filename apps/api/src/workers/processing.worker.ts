@@ -22,11 +22,14 @@ const QUEUE = "processingQueue";
 const JOB = "process-recording";
 
 // — пороги/окна —
-const MIN_MS = 350; // слишком короткие — сразу FAIL
-const BEGINNER_MIN_ANCHORS = 1; // требуемые якоря
-const ADVANCED_MIN_ANCHORS = 2;
-const DUP_MS = 2500; // анти-дубль окно
-const MIN_ASR_LEN = 2; // пустой текст отбрасываем
+const MIN_MS = 350;
+const DUP_MS = 2500;
+const MIN_ASR_LEN = 2;
+
+// caps для повторов
+const HARD_CAP = 5;
+const AVG_MS_BEGINNER = 1200;
+const AVG_MS_ADVANCED = 1000;
 
 type JobData = {
   recordingId: string;
@@ -64,26 +67,56 @@ async function fail(id: string, reason: string, text = "", score = 0) {
   });
 }
 
+// объединённые якоря по всем вариантам
+function unionAnchorsFromVariants(variants: Array<{ anchors: any }>): string[] {
+  const set = new Set<string>();
+  for (const v of variants) {
+    const arr = (v.anchors || []) as string[];
+    for (const a of arr) {
+      if (typeof a === "string" && a.trim()) set.add(a.trim());
+    }
+  }
+  // ограничим длину списка
+  return Array.from(set).slice(0, 12);
+}
+
+function countAnchorHits(asrNorm: string, anchors: string[]): number {
+  const hay1 = asrNorm;
+  const hay2 = asrNorm.replace(/\s+/g, "");
+  let hits = 0;
+  for (const a of anchors) {
+    const needle = a.toLowerCase();
+    if (!needle) continue;
+    const n2 = needle.replace(/\s+/g, "");
+    if (hay1.includes(needle) || hay2.includes(n2)) hits++;
+  }
+  return hits;
+}
+
+function tokenCount(s: string): number {
+  return (s || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
 async function processJob(data: JobData) {
   const { recordingId, userId, zikrId, filePath } = data;
   let { durationMs } = data;
 
   console.log("[job]", { recordingId, userId, zikrId, durationMs, filePath });
 
-  // 0) mark PROCESSING
+  // mark PROCESSING
   await prisma.recording.update({
     where: { id: recordingId },
     data: { status: "PROCESSING" },
   });
 
-  // 1) Быстрая отбраковка длины
+  // быстрый отсев
   if (!durationMs || durationMs < MIN_MS) {
     await fail(recordingId, "too-short");
     await safeUnlink(filePath);
     return;
   }
 
-  // 2) Варианты для зикра
+  // варианты зикра
   const variants = await prisma.zikrVariant.findMany({
     where: { zikrId },
     orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
@@ -96,7 +129,7 @@ async function processJob(data: JobData) {
     return;
   }
 
-  // 3) Пользователь (уровень, TZ)
+  // пользователь
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: { level: true, timezone: true, language: true },
@@ -105,16 +138,10 @@ async function processJob(data: JobData) {
   const tz = user?.timezone || "UTC";
   console.log("[user.level]", userLevel);
 
-  // 4) ASR
+  // ASR
   let asrText = "";
   let asrConf = 0;
   try {
-    // Подсказываем язык, если храните его у пользователя (ru/kz/en/ar)
-    const hintLang =
-      user?.language && ["ru", "kz", "en", "ar"].includes(user.language)
-        ? user.language
-        : "auto";
-
     const r = await asr.transcribe(filePath);
     asrText = (r.text || "").trim();
     asrConf = r.conf || 0;
@@ -130,16 +157,30 @@ async function processJob(data: JobData) {
     return;
   }
 
-  // 5) Матчинг (score + anchorsHit + threshold)
+  // Основной скор по тексту
   const m = matchScore({ asrText, userLevel, variants: variants as any });
   console.log("[match]", m);
-  const minAnchors =
-    userLevel === "BEGINNER" ? BEGINNER_MIN_ANCHORS : ADVANCED_MIN_ANCHORS;
 
-  if (!m.ok || (m.anchorsHit || 0) < minAnchors) {
+  // Смягчаем anchors для коротких зикров/высокого score/новичков
+  const minWords = Math.min(
+    ...variants.map((v) => tokenCount(v.textNorm || "") || 99)
+  );
+  const shortZikr = minWords <= 3;
+  const highScore =
+    (m?.score ?? 0) >= Math.max((m?.threshold ?? 0.62) + 0.25, 0.9);
+  const relaxForBeginner = userLevel === "BEGINNER";
+
+  // Пересчёт попаданий якорей подстрочно (слитные формы)
+  const anchorsUnion = unionAnchorsFromVariants(variants as any);
+  const anchorsHit2 = countAnchorHits(normText, anchorsUnion);
+
+  if (
+    !m.ok ||
+    (anchorsHit2 < 1 && !shortZikr && !highScore && !relaxForBeginner)
+  ) {
     await fail(
       recordingId,
-      !m.ok ? "below-threshold" : `anchors<${minAnchors}`,
+      !m.ok ? "below-threshold" : "anchors<1",
       asrText,
       m.score ?? 0.2
     );
@@ -147,22 +188,65 @@ async function processJob(data: JobData) {
     return;
   }
 
+  // Подсчёт повторов
   // 6) Подсчёт повторов (быстрая речь: «…субханаллах субханаллах…»)
-  // countRepeats ожидает нормализованный текст и список нормализованных эталонов
   let repeats = 1;
   try {
-    const patterns = variants.map((v) => v.textNorm);
-    const rep = countRepeats(normText, variants);
-    if (rep && typeof rep.totalRepeats === "number" && rep.totalRepeats >= 1) {
-      repeats = rep.totalRepeats;
+    // Вариант 1: твой алгоритм
+    const rep = countRepeats(normText, variants as any);
+    const algCount =
+      rep && typeof rep.totalRepeats === "number" ? rep.totalRepeats : 0;
+
+    // Вариант 2 (fallback): макс. число вхождений по шаблонам
+    const tight = normText.replace(/\s+/g, "");
+    const patterns = new Set<string>();
+
+    // из эталонных текстов
+    for (const v of variants) {
+      const t = (v.textNorm || "").toLowerCase().trim();
+      if (!t) continue;
+      patterns.add(t);
+      patterns.add(t.replace(/\s+/g, "")); // слитная форма
     }
-  } catch (e) {
-    // если что-то пошло не так — считаем как 1
+
+    // из объединённых якорей
+    const anchorsUnion = unionAnchorsFromVariants(variants as any);
+    for (const a of anchorsUnion) {
+      const p = (a || "").toLowerCase().trim();
+      if (!p) continue;
+      patterns.add(p);
+      patterns.add(p.replace(/\s+/g, ""));
+    }
+
+    const occ = (hay: string, needle: string) => {
+      if (!needle) return 0;
+      let c = 0,
+        i = 0;
+      while ((i = hay.indexOf(needle, i)) >= 0) {
+        c++;
+        i += Math.max(needle.length, 1);
+      }
+      return c;
+    };
+
+    let fallbackMax = 0;
+    for (const p of patterns) {
+      fallbackMax = Math.max(fallbackMax, occ(normText, p), occ(tight, p));
+    }
+
+    repeats = Math.max(1, algCount, fallbackMax);
+  } catch {
+    repeats = 1;
   }
+  // -------
+  // Кэп по длительности + общий кэп
+  const avgMs = userLevel === "BEGINNER" ? AVG_MS_BEGINNER : AVG_MS_ADVANCED;
+  const capByDuration = Math.max(1, Math.floor((durationMs || 0) / avgMs));
+  repeats = Math.min(repeats, capByDuration, HARD_CAP);
+
   console.log("[repeats]", repeats);
 
-  // 7) Анти-дубль окно — не позволяем насыпать повторно за один и тот же отрезок
-  // (всё равно оставляем, даже с подсчётом повторов)
+  // Антидубль-окно (оставляем)
   const duplicate = await prisma.recording.findFirst({
     where: {
       userId,
@@ -179,7 +263,7 @@ async function processJob(data: JobData) {
     return;
   }
 
-  // 8) Фиксация результата и инкремент счётчиков на repeats
+  // Фиксация и инкременты
   const dayStart = dayStartUtcForTz(new Date(), tz);
 
   await prisma.$transaction(async (tx) => {
@@ -205,7 +289,7 @@ async function processJob(data: JobData) {
       create: { userId, total: repeats },
     });
 
-    // пер-зикровые
+    // по конкретному зикру
     const zikr = await tx.zikr.findUnique({
       where: { id: zikrId },
       select: { target: true },
@@ -225,7 +309,9 @@ async function processJob(data: JobData) {
       },
     });
 
-    if (!dz.completed && dz.count + repeats >= (dz.target ?? target)) {
+    // dz уже содержит обновлённый count при update, для create — count = repeats
+    const newCount = dz.count ?? repeats;
+    if (!dz.completed && newCount >= (dz.target ?? target)) {
       await tx.userZikrDaily.update({
         where: { id: dz.id },
         data: { completed: true },
