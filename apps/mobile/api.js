@@ -31,14 +31,9 @@ async function saveDeviceIdToStores(id) {
 }
 
 function quickUUID() {
-  // Достаточно стабильный псевдо-UUID для девайса
-  const seed = `${Date.now()}-${Math.random()}-${Math.random()}`;
-  const hex = Crypto.digestStringAsync(
-    Crypto.CryptoDigestAlgorithm.SHA256,
-    seed
-  );
-  // вернём синхронно временную заглушку, потом перезапишем
-  return `temp-${Math.floor(Math.random() * 1e9)}`;
+  // один раз сгенерили и сохранили
+  const rand = Math.floor(Math.random() * 1e9).toString(36);
+  return `dev-${Date.now().toString(36)}-${rand}`;
 }
 
 let cachedDeviceIdPromise = null;
@@ -71,6 +66,10 @@ API.interceptors.request.use(async (config) => {
     config.headers = config.headers || {};
     if (!config.headers["X-Device-Id"]) {
       config.headers["X-Device-Id"] = id;
+    }
+    const mode = await getRecognitionModeRaw();
+    if (!config.headers["X-Recog-Mode"]) {
+      config.headers["X-Recog-Mode"] = mode; // 'latin' | 'arabic' | 'auto'
     }
   } catch {}
   return config;

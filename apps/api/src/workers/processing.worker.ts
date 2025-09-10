@@ -7,7 +7,6 @@ import * as fs from "node:fs/promises";
 import { createAsr } from "../verify/asr";
 import { normalizeText } from "../verify/text-utils";
 import { matchScore } from "../verify/matcher";
-import { countRepeats } from "../verify/repeat-counter";
 
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const connection = new IORedis(REDIS_URL, {
@@ -21,15 +20,25 @@ const asr = createAsr();
 const QUEUE = "processingQueue";
 const JOB = "process-recording";
 
-// — пороги/окна —
+// базовые пороги
 const MIN_MS = 350;
 const DUP_MS = 2500;
 const MIN_ASR_LEN = 2;
 
-// caps для повторов
+// уверенность ASR
+const MIN_CONF_LATIN = Number(process.env.MIN_CONF_LATIN || 0.4);
+const MIN_CONF_AR = Number(process.env.MIN_CONF_AR || 0.28);
+
+// верхний жёсткий кэп
 const HARD_CAP = 5;
-const AVG_MS_BEGINNER = 1200;
-const AVG_MS_ADVANCED = 1000;
+
+// VAD-хинт для ASR-сервера
+const ASR_VAD_MIN_SIL_MS = Number(process.env.ASR_VAD_MIN_SIL_MS || 180);
+
+// предпочтительный скрипт для матчера (на подсчёт повторов не влияет)
+const DEFAULT_PREFERRED_SCRIPT = (
+  process.env.MATCH_PREFERRED_SCRIPT || "LATIN"
+).toUpperCase(); // "LATIN" | "AR"
 
 type JobData = {
   recordingId: string;
@@ -67,34 +76,116 @@ async function fail(id: string, reason: string, text = "", score = 0) {
   });
 }
 
-// объединённые якоря по всем вариантам
-function unionAnchorsFromVariants(variants: Array<{ anchors: any }>): string[] {
-  const set = new Set<string>();
-  for (const v of variants) {
-    const arr = (v.anchors || []) as string[];
-    for (const a of arr) {
-      if (typeof a === "string" && a.trim()) set.add(a.trim());
-    }
-  }
-  // ограничим длину списка
-  return Array.from(set).slice(0, 12);
-}
-
-function countAnchorHits(asrNorm: string, anchors: string[]): number {
-  const hay1 = asrNorm;
-  const hay2 = asrNorm.replace(/\s+/g, "");
-  let hits = 0;
-  for (const a of anchors) {
-    const needle = a.toLowerCase();
-    if (!needle) continue;
-    const n2 = needle.replace(/\s+/g, "");
-    if (hay1.includes(needle) || hay2.includes(n2)) hits++;
-  }
-  return hits;
+function hasArabicChars(s: string) {
+  return /[\u0600-\u06FF]/.test(s || "");
 }
 
 function tokenCount(s: string): number {
   return (s || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+/** берём топ-2 нормализованных фраз по каждому скрипту + tight-варианты */
+function buildFullPhrasePatterns(
+  variants: Array<{ script: string; textNorm: string; priority: number }>
+) {
+  const byScript = new Map<string, Array<{ t: string; p: number }>>();
+  for (const v of variants) {
+    const t = (v.textNorm || "").toLowerCase().trim();
+    if (!t) continue;
+    const arr = byScript.get(v.script) || [];
+    arr.push({ t, p: v.priority || 0 });
+    byScript.set(v.script, arr);
+  }
+  const pickTop2 = (arr: Array<{ t: string; p: number }>) =>
+    arr
+      .sort((a, b) => b.p - a.p)
+      .slice(0, 2)
+      .map((x) => x.t);
+
+  const latinBase = pickTop2(byScript.get("LATIN") || []);
+  const arBase = pickTop2(byScript.get("AR") || []);
+
+  const tightify = (s: string) => s.replace(/\s+/g, "");
+  const latin = new Set<string>();
+  const arabic = new Set<string>();
+
+  for (const t of latinBase) {
+    latin.add(t);
+    latin.add(tightify(t));
+  }
+  for (const t of arBase) {
+    arabic.add(t);
+    arabic.add(tightify(t));
+  }
+  return { latin: Array.from(latin), arabic: Array.from(arabic) };
+}
+
+/** строгий подсчёт: неперекрывающиеся вхождения needle в hay (и tight) */
+function countNonOverlapping(hay: string, needle: string) {
+  if (!hay || !needle) return 0;
+  let i = 0;
+  let c = 0;
+  while (true) {
+    const pos = hay.indexOf(needle, i);
+    if (pos < 0) break;
+    c++;
+    i = pos + needle.length;
+  }
+  return c;
+}
+
+function countRepeatsStrict(asrNorm: string, patterns: string[]): number {
+  if (!patterns.length) return 0;
+  const tight = asrNorm.replace(/\s+/g, "");
+  let best = 0;
+  for (const p of patterns) {
+    const n = p.toLowerCase().trim();
+    if (!n) continue;
+    const a = countNonOverlapping(asrNorm, n);
+    const b = countNonOverlapping(tight, n);
+    best = Math.max(best, a, b);
+  }
+  return best;
+}
+
+/** fallback-паттерны из якорей и фраз (фильтруем короткие <5) */
+function buildFallbackPatterns(
+  variants: Array<{ textNorm: string; anchors: any }>
+) {
+  const set = new Set<string>();
+  for (const v of variants) {
+    const t = (v.textNorm || "").toLowerCase().trim();
+    if (t && t.length >= 5) {
+      set.add(t);
+      set.add(t.replace(/\s+/g, ""));
+    }
+    const aa = (v.anchors || []) as string[];
+    for (const a of aa || []) {
+      const x = (a || "").toLowerCase().trim();
+      if (x.length >= 5) {
+        set.add(x);
+        set.add(x.replace(/\s+/g, ""));
+      }
+    }
+  }
+  return Array.from(set);
+}
+
+/** мягкий верхний лимит по длительности (НЕ увеличивает счёт) */
+function capByDurationTop(
+  repeats: number,
+  durationMs: number | null | undefined,
+  hasAR: boolean,
+  minVariantTokens: number
+) {
+  if (!durationMs || durationMs < 400) return repeats;
+  const perToken = hasAR ? 260 : 300; // арабский чуть быстрее
+  const minOneMs = Math.max(
+    600,
+    150 + perToken * Math.max(1, minVariantTokens)
+  );
+  const top = Math.max(1, Math.floor(durationMs / minOneMs));
+  return Math.min(repeats, top);
 }
 
 async function processJob(data: JobData) {
@@ -103,20 +194,18 @@ async function processJob(data: JobData) {
 
   console.log("[job]", { recordingId, userId, zikrId, durationMs, filePath });
 
-  // mark PROCESSING
   await prisma.recording.update({
     where: { id: recordingId },
     data: { status: "PROCESSING" },
   });
 
-  // быстрый отсев
   if (!durationMs || durationMs < MIN_MS) {
     await fail(recordingId, "too-short");
     await safeUnlink(filePath);
     return;
   }
 
-  // варианты зикра
+  // эталоны
   const variants = await prisma.zikrVariant.findMany({
     where: { zikrId },
     orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
@@ -138,17 +227,37 @@ async function processJob(data: JobData) {
   const tz = user?.timezone || "UTC";
   console.log("[user.level]", userLevel);
 
+  // хинт для ASR
+  const hasARvariant = variants.some((v) => (v.script as any) === "AR");
+  const preferAR =
+    DEFAULT_PREFERRED_SCRIPT === "AR" ||
+    userLevel === "ADVANCED" ||
+    user?.language === "ar";
+  const langHint = preferAR && hasARvariant ? "ar" : "auto";
+
   // ASR
   let asrText = "";
   let asrConf = 0;
+  let segCount = 0;
+  let hasAR = false;
   try {
-    const r = await asr.transcribe(filePath);
+    const r: any = await (asr as any).transcribe(filePath, {
+      lang: langHint,
+      vadMinSilMs: ASR_VAD_MIN_SIL_MS,
+    });
     asrText = (r.text || "").trim();
     asrConf = r.conf || 0;
+    segCount = r.segments_count || 0;
+    hasAR = !!r.has_ar || hasArabicChars(asrText);
   } catch (e) {
     console.log("[asr.error]", (e as Error).message);
   }
-  console.log("[asr]", { text: asrText, conf: asrConf });
+  console.log("[asr]", {
+    text: asrText,
+    conf: asrConf,
+    langHint,
+    has_ar: hasAR,
+  });
 
   const normText = normalizeText(asrText);
   if (!normText || normText.length < MIN_ASR_LEN) {
@@ -157,96 +266,57 @@ async function processJob(data: JobData) {
     return;
   }
 
-  // Основной скор по тексту
+  // вспомогательный скор (для логов/страховки)
   const m = matchScore({ asrText, userLevel, variants: variants as any });
   console.log("[match]", m);
 
-  // Смягчаем anchors для коротких зикров/высокого score/новичков
-  const minWords = Math.min(
-    ...variants.map((v) => tokenCount(v.textNorm || "") || 99)
-  );
-  const shortZikr = minWords <= 3;
-  const highScore =
-    (m?.score ?? 0) >= Math.max((m?.threshold ?? 0.62) + 0.25, 0.9);
-  const relaxForBeginner = userLevel === "BEGINNER";
+  // полные фразы
+  const { latin: latinPatterns, arabic: arabicPatterns } =
+    buildFullPhrasePatterns(variants as any);
 
-  // Пересчёт попаданий якорей подстрочно (слитные формы)
-  const anchorsUnion = unionAnchorsFromVariants(variants as any);
-  const anchorsHit2 = countAnchorHits(normText, anchorsUnion);
+  // строгий подсчёт повторов
+  let latinRepeats = countRepeatsStrict(normText, latinPatterns);
+  let arabicRepeats = countRepeatsStrict(normText, arabicPatterns);
+  let repeats = Math.max(latinRepeats, arabicRepeats);
 
-  if (
-    !m.ok ||
-    (anchorsHit2 < 1 && !shortZikr && !highScore && !relaxForBeginner)
-  ) {
-    await fail(
-      recordingId,
-      !m.ok ? "below-threshold" : "anchors<1",
-      asrText,
-      m.score ?? 0.2
-    );
+  // ворота по уверенности
+  const confGate = hasAR ? MIN_CONF_AR : MIN_CONF_LATIN;
+  if (asrConf < confGate) {
+    await fail(recordingId, "low-conf", asrText, m.score ?? 0.2);
     await safeUnlink(filePath);
     return;
   }
 
-  // Подсчёт повторов
-  // 6) Подсчёт повторов (быстрая речь: «…субханаллах субханаллах…»)
-  let repeats = 1;
-  try {
-    // Вариант 1: твой алгоритм
-    const rep = countRepeats(normText, variants as any);
-    const algCount =
-      rep && typeof rep.totalRepeats === "number" ? rep.totalRepeats : 0;
-
-    // Вариант 2 (fallback): макс. число вхождений по шаблонам
-    const tight = normText.replace(/\s+/g, "");
-    const patterns = new Set<string>();
-
-    // из эталонных текстов
-    for (const v of variants) {
-      const t = (v.textNorm || "").toLowerCase().trim();
-      if (!t) continue;
-      patterns.add(t);
-      patterns.add(t.replace(/\s+/g, "")); // слитная форма
+  // если строгих полных совпадений нет — мягкий fallback по «сильным» паттернам (>=5 символов)
+  if (repeats < 1) {
+    const fallbackPatterns = buildFallbackPatterns(variants as any);
+    const fallbackRepeats = countRepeatsStrict(normText, fallbackPatterns);
+    if (fallbackRepeats >= 1 && m.ok) {
+      repeats = fallbackRepeats;
+      console.log("[fallback] repeats via strong patterns =", repeats);
+    } else {
+      await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
+      await safeUnlink(filePath);
+      return;
     }
-
-    // из объединённых якорей
-    const anchorsUnion = unionAnchorsFromVariants(variants as any);
-    for (const a of anchorsUnion) {
-      const p = (a || "").toLowerCase().trim();
-      if (!p) continue;
-      patterns.add(p);
-      patterns.add(p.replace(/\s+/g, ""));
-    }
-
-    const occ = (hay: string, needle: string) => {
-      if (!needle) return 0;
-      let c = 0,
-        i = 0;
-      while ((i = hay.indexOf(needle, i)) >= 0) {
-        c++;
-        i += Math.max(needle.length, 1);
-      }
-      return c;
-    };
-
-    let fallbackMax = 0;
-    for (const p of patterns) {
-      fallbackMax = Math.max(fallbackMax, occ(normText, p), occ(tight, p));
-    }
-
-    repeats = Math.max(1, algCount, fallbackMax);
-  } catch {
-    repeats = 1;
   }
-  // -------
-  // Кэп по длительности + общий кэп
-  const avgMs = userLevel === "BEGINNER" ? AVG_MS_BEGINNER : AVG_MS_ADVANCED;
-  const capByDuration = Math.max(1, Math.floor((durationMs || 0) / avgMs));
-  repeats = Math.min(repeats, capByDuration, HARD_CAP);
 
-  console.log("[repeats]", repeats);
+  // ограничим сверху длительностью (не увеличиваем!)
+  const minVariantTokens = Math.min(
+    ...variants.map((v) => tokenCount(v.textNorm || "") || 1)
+  );
+  repeats = capByDurationTop(repeats, durationMs, hasAR, minVariantTokens);
 
-  // Антидубль-окно (оставляем)
+  // жёсткий кэп
+  repeats = Math.min(repeats, HARD_CAP);
+
+  console.log("[repeats]", repeats, hasAR ? "(AR)" : "(LATIN)", {
+    latinRepeats,
+    arabicRepeats,
+    segCount,
+  });
+
+  // антидубль-окно
   const duplicate = await prisma.recording.findFirst({
     where: {
       userId,
@@ -263,7 +333,7 @@ async function processJob(data: JobData) {
     return;
   }
 
-  // Фиксация и инкременты
+  // фиксация и инкременты
   const dayStart = dayStartUtcForTz(new Date(), tz);
 
   await prisma.$transaction(async (tx) => {
@@ -274,10 +344,10 @@ async function processJob(data: JobData) {
         processedAt: new Date(),
         text: asrText,
         score: m.score ?? 0.85,
+        repeats, // для фронта — показывать +N
       },
     });
 
-    // глобальные
     await tx.dailyCounter.upsert({
       where: { userId_date: { userId, date: dayStart } },
       update: { count: { increment: repeats } },
@@ -289,7 +359,6 @@ async function processJob(data: JobData) {
       create: { userId, total: repeats },
     });
 
-    // по конкретному зикру
     const zikr = await tx.zikr.findUnique({
       where: { id: zikrId },
       select: { target: true },
@@ -309,7 +378,6 @@ async function processJob(data: JobData) {
       },
     });
 
-    // dz уже содержит обновлённый count при update, для create — count = repeats
     const newCount = dz.count ?? repeats;
     if (!dz.completed && newCount >= (dz.target ?? target)) {
       await tx.userZikrDaily.update({
@@ -323,7 +391,6 @@ async function processJob(data: JobData) {
 }
 
 // ————————————————————————————————————————————
-
 new Worker(
   QUEUE,
   async (job) => {

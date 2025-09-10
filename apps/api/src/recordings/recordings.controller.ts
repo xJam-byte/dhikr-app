@@ -54,6 +54,12 @@ export class RecordingsController {
   ) {
     const deviceId = (req.headers["x-device-id"] as string) || "unknown";
 
+    const hdr = (
+      req.headers["x-recog-mode"] as string | undefined
+    )?.toLowerCase();
+    const recogMode =
+      hdr === "arabic" ? "arabic" : hdr === "auto" ? "auto" : "latin";
+
     console.log("[upload hit]", {
       hasFile: !!file,
       size: file?.size,
@@ -109,6 +115,7 @@ export class RecordingsController {
       zikrId,
       filePath,
       durationMs: durationMs ? Number(durationMs) : null,
+      recogMode,
     });
 
     return { id: rec.id, status: rec.status, message: "Queued for processing" };

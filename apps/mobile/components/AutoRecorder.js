@@ -9,9 +9,9 @@ import API from "../api";
 // Мягкий VAD + антидубль
 const VAD = {
   meteringThresholdDb: -50,
-  minSpeechMs: 400,
-  silenceMs: 800,
-  maxChunkMs: 6000,
+  minSpeechMs: 320, // было 400
+  silenceMs: 420, // было 800 → быстрее финализируем чанк
+  maxChunkMs: 5500, // чуть короче
   minVoiceStreakMs: 120,
   progressUpdateMs: 120,
   postSuccessMuteMs: 1200,

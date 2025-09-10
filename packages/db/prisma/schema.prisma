@@ -73,6 +73,7 @@ model Recording {
   checksum    String          @unique
   createdAt   DateTime        @default(now())
   status      RecordingStatus @default(QUEUED)
+  repeats      Int      @default(1)
   text        String?
   score       Float?
   processedAt DateTime?

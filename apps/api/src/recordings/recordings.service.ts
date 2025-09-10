@@ -1,4 +1,3 @@
-// apps/api/src/recordings/recordings.service.ts
 import { BadRequestException, Injectable } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
 
@@ -20,7 +19,6 @@ export class RecordingsService {
     if (!dto?.checksum) throw new BadRequestException("Missing checksum");
     if (!dto?.zikrId) throw new BadRequestException("Missing zikrId");
 
-    // антидубликат по checksum для этого пользователя
     const dup = await this.prisma.recording.findFirst({
       where: { checksum: dto.checksum, userId },
       select: { id: true, status: true },
@@ -39,14 +37,32 @@ export class RecordingsService {
         text: "",
         score: 0.0,
       },
-      select: { id: true, status: true /* если нужно: durationMs: true */ },
+      select: { id: true, status: true },
     });
 
-    return rec; // без постановки в очередь — это делает контроллер
+    return rec;
   }
 
   async get(id: string) {
-    return this.prisma.recording.findUnique({ where: { id } });
+    const r = await this.prisma.recording.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        status: true,
+        repeats: true,
+        score: true,
+        text: true,
+      },
+    });
+    if (!r) throw new BadRequestException("not_found");
+
+    return {
+      id: r.id,
+      status: r.status,
+      repeats: Math.max(1, r.repeats ?? 1),
+      score: r.score ?? undefined,
+      text: r.text ?? undefined,
+    };
   }
 
   async deleteByDevice(deviceId: string, recId: string) {

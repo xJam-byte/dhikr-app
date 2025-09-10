@@ -1,5 +1,11 @@
 // apps/mobile/screens/ZikrListScreen.js
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useCallback,
+} from "react";
 import {
   View,
   FlatList,
@@ -9,6 +15,7 @@ import {
   Text,
   useWindowDimensions,
 } from "react-native";
+import { useFocusEffect } from "@react-navigation/native";
 import API from "../api";
 import AppHeader from "../components/AppHeader";
 import ZikrCard from "../components/ZikrCard";
@@ -16,7 +23,6 @@ import CounterPill from "../components/CounterPill";
 import SearchBar from "../components/SearchBar";
 import Chip from "../components/Chip";
 import { colors, spacing } from "../theme/tokens";
-import useZikrProgress from "../hooks/useZikrProgress";
 import { useAppLang } from "../hooks/useAppLang";
 import { useTranslation } from "react-i18next";
 import { toTransMap } from "../utils/zikrText";
@@ -47,33 +53,57 @@ const toCanonicalCat = (v) => {
 export default function ZikrListScreen({ navigation }) {
   const [list, setList] = useState([]);
   const [counts, setCounts] = useState({ todayCount: 0, totalCount: 0 });
+  const [perZikrCounts, setPerZikrCounts] = useState({});
   const [refreshing, setRefreshing] = useState(false);
   const [q, setQ] = useState("");
   const [cat, setCat] = useState("all");
   const pagerRef = useRef(null);
   const { width } = useWindowDimensions();
 
-  const { getProgress, reloadProgress } = useZikrProgress();
   const { lang } = useAppLang();
   const { t } = useTranslation();
 
-  const load = async () => {
-    const [z, c] = await Promise.all([
-      API.get("/zikr?limit=200"),
-      API.get("/counters/today"),
-    ]);
-    const items = (z.data.items || []).map((it) => ({
-      ...it,
-      category: toCanonicalCat(it.category),
-    }));
-    setList(items);
-    setCounts(c.data || { todayCount: 0, totalCount: 0 });
-    await reloadProgress();
-  };
+  const load = useCallback(async () => {
+    try {
+      const z = await API.get("/zikr?limit=200");
+      const items = (z?.data?.items || []).map((it) => ({
+        ...it,
+        category: toCanonicalCat(it.category),
+      }));
+      setList(items);
+    } catch {
+      setList([]);
+    }
+
+    try {
+      const c = await API.get("/counters/today");
+      setCounts(c?.data || { todayCount: 0, totalCount: 0 });
+    } catch {
+      setCounts({ todayCount: 0, totalCount: 0 });
+    }
+
+    try {
+      const byZ = await API.get("/counters/by-zikr");
+      const map = {};
+      (byZ?.data || []).forEach((row) => {
+        if (row?.zikrId) map[row.zikrId] = row.count ?? 0;
+      });
+      setPerZikrCounts(map);
+    } catch {
+      setPerZikrCounts({});
+    }
+  }, []);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load]);
+
+  // авто-рефреш при возврате на экран
+  useFocusEffect(
+    useCallback(() => {
+      load();
+    }, [load])
+  );
 
   const filterBy = (catKey) => {
     const term = q.trim().toLowerCase();
@@ -137,7 +167,7 @@ export default function ZikrListScreen({ navigation }) {
         }
         renderItem={({ item, index }) => {
           const target = item.target ?? 33;
-          const prog = getProgress(item.id);
+          const prog = perZikrCounts[item.id] ?? 0; // ← серверный прогресс
           return (
             <AnimatedCard index={index}>
               <ZikrCard
@@ -177,7 +207,7 @@ export default function ZikrListScreen({ navigation }) {
       <View style={styles.filtersBlock}>
         <SearchBar
           value={q}
-          onChange={setQ} // ← ключевая правка
+          onChange={setQ}
           placeholder={t("searchPlaceholder")}
         />
         <ScrollView
