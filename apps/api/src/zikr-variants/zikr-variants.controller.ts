@@ -14,4 +14,11 @@ export class ZikrVariantsController {
   byZikr(@Param("zikrId") zikrId: string) {
     return this.svc.listByZikr(zikrId);
   }
+
+  @Get("all")
+  all() {
+    console.log("Get all zikr variants");
+
+    return this.svc.getAll();
+  }
 }

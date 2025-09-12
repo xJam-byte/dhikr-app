@@ -1,6 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
 import { VariantScript } from "@prisma/client"; // <— ИЗ PRISMA, не из своих утилит
+import { log } from "node:console";
 
 type VariantInput = {
   zikrId: string;
@@ -30,7 +31,7 @@ function toVariantScript(s: VariantInput["script"]): VariantScript {
 export class ZikrVariantsService {
   constructor(private prisma: PrismaService) {}
 
-    async upsertMany(variants: VariantInput[]) {
+  async upsertMany(variants: VariantInput[]) {
     const tasks = variants.map((v) => {
       const script = toVariantScript(v.script);
       return this.prisma.zikrVariant.upsert({
@@ -62,9 +63,19 @@ export class ZikrVariantsService {
     return this.prisma.$transaction(tasks);
   }
   listByZikr(zikrId: string) {
+    // console.log(`List variants for zikr ${zikrId}`);
+
     return this.prisma.zikrVariant.findMany({
       where: { zikrId },
       orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+    });
+  }
+
+  getAll() {
+    // console.log("Get all zikr variants");
+
+    return this.prisma.zikrVariant.findMany({
+      where: { id: { not: "" } },
     });
   }
 }

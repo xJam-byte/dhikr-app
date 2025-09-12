@@ -5,10 +5,17 @@ import IORedis from "ioredis";
 import { PrismaClient } from "@prisma/client";
 import * as fs from "node:fs/promises";
 import { createAsr } from "../verify/asr";
-import { normalizeText } from "../verify/text-utils";
+import { normalizeText, buildVariantRegex } from "../verify/text-utils";
 import { matchScore } from "../verify/matcher";
+import * as RepeatCounter from "../verify/repeat-counter";
+import { ConfigService } from "../config/config.service";
 
-const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+// ──────────────────────────────────────────────────────────────────────────────
+// Config
+// ──────────────────────────────────────────────────────────────────────────────
+const cfg = new ConfigService();
+
+const REDIS_URL = cfg.redisUrl;
 const connection = new IORedis(REDIS_URL, {
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
@@ -20,25 +27,49 @@ const asr = createAsr();
 const QUEUE = "processingQueue";
 const JOB = "process-recording";
 
-// базовые пороги
-const MIN_MS = 350;
-const DUP_MS = 2500;
+// concurrency с защитой
+const RAW_CONC = Number((cfg.workerConcurrency as any) ?? NaN);
+const WORKER_CONCURRENCY =
+  Number.isFinite(RAW_CONC) && RAW_CONC > 0 ? Math.floor(RAW_CONC) : 2;
+console.log(
+  "[worker] concurrency =",
+  WORKER_CONCURRENCY,
+  "env:",
+  process.env.WORKER_CONCURRENCY
+);
+
+// базовые пороги (жёстко приводим к number)
+const MIN_MS = Number.isFinite(Number(cfg.minRecordingMs))
+  ? Number(cfg.minRecordingMs)
+  : 350;
+const DUP_MS = Number.isFinite(Number(cfg.duplicateWindowMs))
+  ? Number(cfg.duplicateWindowMs)
+  : 2500;
 const MIN_ASR_LEN = 2;
 
 // уверенность ASR
-const MIN_CONF_LATIN = Number(process.env.MIN_CONF_LATIN || 0.4);
-const MIN_CONF_AR = Number(process.env.MIN_CONF_AR || 0.28);
+const MIN_CONF_LATIN = Number.isFinite(Number(cfg.minConfLatin))
+  ? Number(cfg.minConfLatin)
+  : 0.4;
+const MIN_CONF_AR = Number.isFinite(Number(cfg.minConfAr))
+  ? Number(cfg.minConfAr)
+  : 0.28;
 
 // верхний жёсткий кэп
-const HARD_CAP = 5;
+const HARD_CAP = Number.isFinite(Number(cfg.hardCapRepeats))
+  ? Number(cfg.hardCapRepeats)
+  : 5;
 
 // VAD-хинт для ASR-сервера
-const ASR_VAD_MIN_SIL_MS = Number(process.env.ASR_VAD_MIN_SIL_MS || 180);
+const ASR_VAD_MIN_SIL_MS = Number.isFinite(Number(cfg.asrVadMinSilMs))
+  ? Number(cfg.asrVadMinSilMs)
+  : 180;
 
-// предпочтительный скрипт для матчера (на подсчёт повторов не влияет)
-const DEFAULT_PREFERRED_SCRIPT = (
-  process.env.MATCH_PREFERRED_SCRIPT || "LATIN"
-).toUpperCase(); // "LATIN" | "AR"
+// предпочтительный скрипт
+const DEFAULT_PREFERRED_SCRIPT =
+  (cfg.matchPreferredScript as "LATIN" | "AR") || "LATIN";
+
+// ──────────────────────────────────────────────────────────────────────────────
 
 type JobData = {
   recordingId: string;
@@ -84,91 +115,15 @@ function tokenCount(s: string): number {
   return (s || "").trim().split(/\s+/).filter(Boolean).length;
 }
 
-/** берём топ-2 нормализованных фраз по каждому скрипту + tight-варианты */
-function buildFullPhrasePatterns(
-  variants: Array<{ script: string; textNorm: string; priority: number }>
-) {
-  const byScript = new Map<string, Array<{ t: string; p: number }>>();
-  for (const v of variants) {
-    const t = (v.textNorm || "").toLowerCase().trim();
-    if (!t) continue;
-    const arr = byScript.get(v.script) || [];
-    arr.push({ t, p: v.priority || 0 });
-    byScript.set(v.script, arr);
-  }
-  const pickTop2 = (arr: Array<{ t: string; p: number }>) =>
-    arr
-      .sort((a, b) => b.p - a.p)
-      .slice(0, 2)
-      .map((x) => x.t);
-
-  const latinBase = pickTop2(byScript.get("LATIN") || []);
-  const arBase = pickTop2(byScript.get("AR") || []);
-
-  const tightify = (s: string) => s.replace(/\s+/g, "");
-  const latin = new Set<string>();
-  const arabic = new Set<string>();
-
-  for (const t of latinBase) {
-    latin.add(t);
-    latin.add(tightify(t));
-  }
-  for (const t of arBase) {
-    arabic.add(t);
-    arabic.add(tightify(t));
-  }
-  return { latin: Array.from(latin), arabic: Array.from(arabic) };
-}
-
-/** строгий подсчёт: неперекрывающиеся вхождения needle в hay (и tight) */
-function countNonOverlapping(hay: string, needle: string) {
-  if (!hay || !needle) return 0;
-  let i = 0;
-  let c = 0;
-  while (true) {
-    const pos = hay.indexOf(needle, i);
-    if (pos < 0) break;
-    c++;
-    i = pos + needle.length;
-  }
-  return c;
-}
-
-function countRepeatsStrict(asrNorm: string, patterns: string[]): number {
-  if (!patterns.length) return 0;
-  const tight = asrNorm.replace(/\s+/g, "");
-  let best = 0;
-  for (const p of patterns) {
-    const n = p.toLowerCase().trim();
-    if (!n) continue;
-    const a = countNonOverlapping(asrNorm, n);
-    const b = countNonOverlapping(tight, n);
-    best = Math.max(best, a, b);
-  }
-  return best;
-}
-
-/** fallback-паттерны из якорей и фраз (фильтруем короткие <5) */
-function buildFallbackPatterns(
-  variants: Array<{ textNorm: string; anchors: any }>
-) {
-  const set = new Set<string>();
-  for (const v of variants) {
-    const t = (v.textNorm || "").toLowerCase().trim();
-    if (t && t.length >= 5) {
-      set.add(t);
-      set.add(t.replace(/\s+/g, ""));
-    }
-    const aa = (v.anchors || []) as string[];
-    for (const a of aa || []) {
-      const x = (a || "").toLowerCase().trim();
-      if (x.length >= 5) {
-        set.add(x);
-        set.add(x.replace(/\s+/g, ""));
-      }
-    }
-  }
-  return Array.from(set);
+function pickTopVariantByScript<
+  T extends { script: string; textNorm: string; priority?: number }
+>(variants: T[], script: "AR" | "LATIN"): string | undefined {
+  const pool = variants
+    .filter((v) => (v.script as any) === script)
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+  const top = pool[0];
+  const t = (top?.textNorm || "").trim();
+  return t || undefined;
 }
 
 /** мягкий верхний лимит по длительности (НЕ увеличивает счёт) */
@@ -178,28 +133,214 @@ function capByDurationTop(
   hasAR: boolean,
   minVariantTokens: number
 ) {
-  if (!durationMs || durationMs < 400) return repeats;
-  const perToken = hasAR ? 260 : 300; // арабский чуть быстрее
-  const minOneMs = Math.max(
-    600,
-    150 + perToken * Math.max(1, minVariantTokens)
+  const repN = Number(repeats);
+  const dMs = Number(durationMs);
+  if (!Number.isFinite(dMs) || dMs < 400) return repN;
+
+  const perToken = hasAR ? 260 : 300;
+  const tokens = Math.max(
+    1,
+    Number.isFinite(minVariantTokens) ? minVariantTokens : 1
   );
-  const top = Math.max(1, Math.floor(durationMs / minOneMs));
-  return Math.min(repeats, top);
+  const minOneMs = Math.max(600, 150 + perToken * tokens);
+  const top = Math.max(1, Math.floor(dMs / minOneMs));
+  return Math.min(repN, top);
+}
+
+/** Точный подсчёт повторов полной фразы (и для spaced, и для tight) */
+function countExactPhraseRepeats(text: string, phrase?: string): number {
+  if (!phrase) return 0;
+  const haySpaced = normalizeText(text || "");
+  if (!haySpaced) return 0;
+
+  const needleSpaced = normalizeText(phrase);
+  if (!needleSpaced) return 0;
+
+  const hayTight = haySpaced.replace(/\s+/g, "");
+  const needleTight = needleSpaced.replace(/\s+/g, "");
+
+  const countNonOverlap = (hay: string, needle: string) => {
+    if (!hay || !needle) return 0;
+    let i = 0,
+      c = 0;
+    while (true) {
+      const pos = hay.indexOf(needle, i);
+      if (pos < 0) break;
+      c++;
+      i = pos + needle.length; // неперекрывающиеся (важно для back-to-back)
+    }
+    return c;
+  };
+
+  const a = countNonOverlap(haySpaced, needleSpaced);
+  const b = countNonOverlap(hayTight, needleTight);
+  return Math.max(a, b);
+}
+
+/** Fallback: подсчёт по regex с фразами */
+function countRepeatsRegex(
+  text: string,
+  phraseArabic?: string,
+  phraseLatin?: string
+) {
+  const t = normalizeText(text);
+  if (!t) return 0;
+
+  const ranges: Array<{ start: number; end: number }> = [];
+
+  function collect(re: RegExp) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(t))) {
+      const full = m[0];
+      const end = re.lastIndex;
+      const start = end - full.length;
+      ranges.push({ start, end });
+      if (m.index === re.lastIndex) re.lastIndex++;
+    }
+  }
+
+  if (phraseArabic)
+    collect(buildVariantRegex(normalizeText(phraseArabic), "AR"));
+  if (phraseLatin)
+    collect(buildVariantRegex(normalizeText(phraseLatin), "LATIN"));
+
+  ranges.sort((a, b) => a.start - b.start);
+  const merged: typeof ranges = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (!last || r.start > last.end) merged.push({ ...r });
+    else last.end = Math.max(last.end, r.end);
+  }
+  return merged.length;
+}
+
+function strongPatternsFromVariants(
+  variants: Array<{ textNorm: string; anchors?: string[] }>
+): string[] {
+  const set = new Set<string>();
+
+  const push = (s: string) => {
+    const t = normalizeText(s || "");
+    if (!t) return;
+    set.add(t);
+    set.add(t.replace(/\s+/g, "")); // tight
+  };
+
+  for (const v of variants) {
+    if (v.textNorm) push(v.textNorm);
+    for (const a of v.anchors || []) {
+      const n = normalizeText(a || "");
+      if (n.length >= 3) push(n); // опущен порог до 3 — важные AR токены
+    }
+  }
+
+  return Array.from(set);
+}
+
+/** Подсчёт по сильным паттернам (см. обсуждение) */
+function countByStrongPatterns(text: string, patterns: string[]): number {
+  if (!text || patterns.length === 0) return 0;
+
+  const spaced = normalizeText(text);
+  const tight = spaced.replace(/\s+/g, "");
+
+  const splitTokens = (s: string) => s.trim().split(/\s+/).filter(Boolean);
+  const normPatterns = patterns.map((p) => normalizeText(p)).filter(Boolean);
+  const multi = normPatterns.filter((p) => splitTokens(p).length >= 2);
+  const single = normPatterns.filter((p) => splitTokens(p).length === 1);
+
+  const countForHay = (hay: string): number => {
+    if (!hay) return 0;
+    type R = { start: number; end: number };
+    const collect = (needle: string): R[] => {
+      const out: R[] = [];
+      let i = 0;
+      while (true) {
+        const pos = hay.indexOf(needle, i);
+        if (pos < 0) break;
+        const start = pos;
+        const end = pos + needle.length;
+        out.push({ start, end });
+        i = end; // неперекрывающиеся
+      }
+      return out;
+    };
+
+    const gapTol = 1;
+    let ranges: R[] = [];
+    for (const p of multi) ranges.push(...collect(p));
+    if (ranges.length) {
+      ranges.sort((a, b) => a.start - b.start);
+      const merged: R[] = [ranges[0]];
+      for (let i = 1; i < ranges.length; i++) {
+        const prev = merged[merged.length - 1];
+        const cur = ranges[i];
+        const gap = cur.start - prev.end;
+        if ((gap >= 0 && gap <= gapTol) || cur.start < prev.end) {
+          prev.end = Math.max(prev.end, cur.end);
+        } else {
+          merged.push({ ...cur });
+        }
+      }
+      ranges = merged;
+    }
+
+    // одиночные считаем как отдельные неперекрывающиеся вхождения (без кластеризации),
+    // но игнорируем те, что попали внутрь уже найденных multi
+    const inside = (pos: number) =>
+      ranges.some((r) => pos >= r.start && pos <= r.end);
+
+    let singles: R[] = [];
+    for (const p of single) singles.push(...collect(p));
+    singles.sort((a, b) => a.start - b.start);
+    singles = singles.filter((s) => !inside(s.start) && !inside(s.end));
+
+    ranges.push(...singles);
+
+    if (!ranges.length) return 0;
+    ranges.sort((a, b) => a.start - b.start);
+    const final: R[] = [ranges[0]];
+    for (let i = 1; i < ranges.length; i++) {
+      const prev = final[final.length - 1];
+      const cur = ranges[i];
+      if (cur.start < prev.end) prev.end = Math.max(prev.end, cur.end);
+      else final.push({ ...cur });
+    }
+    return final.length;
+  };
+
+  const cSpaced = countForHay(spaced);
+  const cTight = countForHay(tight);
+  const best = Math.max(cSpaced, cTight);
+  console.log("[strongPatterns.counts]", {
+    spaced: cSpaced,
+    tight: cTight,
+    best,
+  });
+  return best;
 }
 
 async function processJob(data: JobData) {
   const { recordingId, userId, zikrId, filePath } = data;
   let { durationMs } = data;
 
-  console.log("[job]", { recordingId, userId, zikrId, durationMs, filePath });
+  const DURATION_MS = Number.isFinite(Number(durationMs))
+    ? Number(durationMs)
+    : 0;
+  console.log("[job]", {
+    recordingId,
+    userId,
+    zikrId,
+    durationMs: DURATION_MS,
+    filePath,
+  });
 
   await prisma.recording.update({
     where: { id: recordingId },
     data: { status: "PROCESSING" },
   });
 
-  if (!durationMs || durationMs < MIN_MS) {
+  if (!Number.isFinite(DURATION_MS) || DURATION_MS < MIN_MS) {
     await fail(recordingId, "too-short");
     await safeUnlink(filePath);
     return;
@@ -240,15 +381,17 @@ async function processJob(data: JobData) {
   let asrConf = 0;
   let segCount = 0;
   let hasAR = false;
+  let words: Array<{ w: string; start: number; end: number; p?: number }> = [];
   try {
     const r: any = await (asr as any).transcribe(filePath, {
       lang: langHint,
       vadMinSilMs: ASR_VAD_MIN_SIL_MS,
     });
     asrText = (r.text || "").trim();
-    asrConf = r.conf || 0;
-    segCount = r.segments_count || 0;
+    asrConf = Number(r.conf || 0);
+    segCount = Number(r.segments_count || 0);
     hasAR = !!r.has_ar || hasArabicChars(asrText);
+    words = Array.isArray(r.words) ? r.words : [];
   } catch (e) {
     console.log("[asr.error]", (e as Error).message);
   }
@@ -257,6 +400,7 @@ async function processJob(data: JobData) {
     conf: asrConf,
     langHint,
     has_ar: hasAR,
+    words: words.length,
   });
 
   const normText = normalizeText(asrText);
@@ -266,63 +410,123 @@ async function processJob(data: JobData) {
     return;
   }
 
-  // вспомогательный скор (для логов/страховки)
+  // вспомогательный скор
   const m = matchScore({ asrText, userLevel, variants: variants as any });
   console.log("[match]", m);
 
-  // полные фразы
-  const { latin: latinPatterns, arabic: arabicPatterns } =
-    buildFullPhrasePatterns(variants as any);
+  // Выбираем топ-1 фразу по приоритету для каждого скрипта
+  const phraseLatin = pickTopVariantByScript(variants as any, "LATIN");
+  const phraseArabic = pickTopVariantByScript(variants as any, "AR");
 
-  // строгий подсчёт повторов
-  let latinRepeats = countRepeatsStrict(normText, latinPatterns);
-  let arabicRepeats = countRepeatsStrict(normText, arabicPatterns);
-  let repeats = Math.max(latinRepeats, arabicRepeats);
-
-  // ворота по уверенности
+  // ворота по уверенности (с мягким override)
   const confGate = hasAR ? MIN_CONF_AR : MIN_CONF_LATIN;
-  if (asrConf < confGate) {
+  const allowLowConf = m?.ok && (m?.score ?? 0) >= 1.0;
+  if ((!Number.isFinite(asrConf) || asrConf < confGate) && !allowLowConf) {
     await fail(recordingId, "low-conf", asrText, m.score ?? 0.2);
     await safeUnlink(filePath);
     return;
   }
+  if (allowLowConf && asrConf < confGate) {
+    console.log(
+      "[low-conf override] conf:",
+      asrConf,
+      "gate:",
+      confGate,
+      "score:",
+      m.score
+    );
+  }
 
-  // если строгих полных совпадений нет — мягкий fallback по «сильным» паттернам (>=5 символов)
-  if (repeats < 1) {
-    const fallbackPatterns = buildFallbackPatterns(variants as any);
-    const fallbackRepeats = countRepeatsStrict(normText, fallbackPatterns);
-    if (fallbackRepeats >= 1 && m.ok) {
-      repeats = fallbackRepeats;
-      console.log("[fallback] repeats via strong patterns =", repeats);
-    } else {
-      await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
-      await safeUnlink(filePath);
-      return;
+  // Подсчёт повторов
+  const durationSec = DURATION_MS / 1000;
+
+  let repeatsNum = 0;
+
+  // 0) Самый надёжный: точные повторы ПОЛНОЙ фразы (и AR, и LAT) на spaced/tight
+  const exactLatin = countExactPhraseRepeats(asrText, phraseLatin);
+  const exactArabic = countExactPhraseRepeats(asrText, phraseArabic);
+  const exactBest = Math.max(exactLatin, exactArabic);
+  if (exactBest > 0) {
+    repeatsNum = exactBest;
+    console.log("[repeats.exactPhrase]", {
+      exactLatin,
+      exactArabic,
+      exactBest,
+    });
+  } else if (
+    words.length > 0 &&
+    typeof RepeatCounter.countRepeatsUnified === "function"
+  ) {
+    // 1) По словам (если пришли word timestamps)
+    const intervals = RepeatCounter.countRepeatsUnified(
+      words,
+      phraseArabic,
+      phraseLatin,
+      durationSec
+    );
+    repeatsNum = intervals.length;
+    console.log("[repeats.byWords]", repeatsNum);
+  } else {
+    // 2) Регексы по фразам
+    repeatsNum = countRepeatsRegex(asrText, phraseArabic, phraseLatin);
+    console.log("[repeats.regexFallback]", repeatsNum);
+
+    // 3) Сильные паттерны из всех variants (фраза + anchors)
+    if (repeatsNum < 1) {
+      const strong = strongPatternsFromVariants(variants as any);
+      const r2 = countByStrongPatterns(asrText, strong);
+      if (r2 > 0) {
+        repeatsNum = r2;
+        console.log("[repeats.strongPatterns]", repeatsNum);
+      }
     }
+  }
+
+  // если 0, но матч высокий — ещё раз по сильным паттернам
+  if (
+    (!Number.isFinite(repeatsNum) || repeatsNum < 1) &&
+    (m.ok || (m.score ?? 0) > 0.85)
+  ) {
+    const strong = strongPatternsFromVariants(variants as any);
+    const r3 = countByStrongPatterns(asrText, strong);
+    if (r3 > (repeatsNum || 0)) {
+      repeatsNum = r3;
+      console.log("[fallback.strongRetry]", repeatsNum);
+    }
+  }
+
+  if (!Number.isFinite(repeatsNum) || repeatsNum < 1) {
+    await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
+    await safeUnlink(filePath);
+    return;
   }
 
   // ограничим сверху длительностью (не увеличиваем!)
   const minVariantTokens = Math.min(
     ...variants.map((v) => tokenCount(v.textNorm || "") || 1)
   );
-  repeats = capByDurationTop(repeats, durationMs, hasAR, minVariantTokens);
+  const repeatsCapped = capByDurationTop(
+    repeatsNum,
+    DURATION_MS,
+    hasAR,
+    minVariantTokens
+  );
 
   // жёсткий кэп
-  repeats = Math.min(repeats, HARD_CAP);
+  const repeats = Math.min(Number(repeatsCapped), HARD_CAP);
 
-  console.log("[repeats]", repeats, hasAR ? "(AR)" : "(LATIN)", {
-    latinRepeats,
-    arabicRepeats,
-    segCount,
-  });
+  console.log("[repeats.final]", repeats, hasAR ? "(AR)" : "(LATIN)");
 
   // антидубль-окно
+  const dupWindow = Number.isFinite(DUP_MS) && DUP_MS > 0 ? DUP_MS : 2500;
+  const gteDate = new Date(Date.now() - dupWindow);
+
   const duplicate = await prisma.recording.findFirst({
     where: {
       userId,
       zikrId,
       status: "DONE",
-      processedAt: { gte: new Date(Date.now() - DUP_MS) },
+      processedAt: { gte: gteDate },
     },
     select: { id: true },
     orderBy: { processedAt: "desc" },
@@ -333,7 +537,7 @@ async function processJob(data: JobData) {
     return;
   }
 
-  // фиксация и инкременты
+  // фиксация и инкременты (атомарно)
   const dayStart = dayStartUtcForTz(new Date(), tz);
 
   await prisma.$transaction(async (tx) => {
@@ -344,7 +548,7 @@ async function processJob(data: JobData) {
         processedAt: new Date(),
         text: asrText,
         score: m.score ?? 0.85,
-        repeats, // для фронта — показывать +N
+        repeats,
       },
     });
 
@@ -397,7 +601,7 @@ new Worker(
     if (job.name !== JOB) return;
     await processJob(job.data as JobData);
   },
-  { connection, concurrency: 2 }
+  { connection, concurrency: WORKER_CONCURRENCY }
 )
   .on("completed", (job) => console.log("✅ worker done", job.id))
   .on("failed", (job, err) => console.error("❌ worker failed", job?.id, err));
