@@ -59,6 +59,19 @@ apps/py_asr/*.pt
 apps/py_asr/*.bin
 apps/py_asr/*.tflite
 
+apps/aligner-ctc/.venv
+apps/aligner-ctc/venv
+apps/aligner-ctc/__pycache__/
+apps/aligner-ctc/.mypy_cache/
+apps/aligner-ctc/.pytest_cache/
+apps/aligner-ctc/.ruff_cache/
+apps/aligner-ctc/.ipynb_checkpoints/
+apps/aligner-ctc/models/
+apps/aligner-ctc/downloads/
+apps/aligner-ctc/*.onnx
+apps/aligner-ctc/*.pt
+apps/aligner-ctc/*.bin
+apps/aligner-ctc/*.tflite
 # --- DB / OS junk ---
 *.sqlite
 *.db

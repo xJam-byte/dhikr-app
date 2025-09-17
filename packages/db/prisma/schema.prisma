@@ -79,6 +79,7 @@ model Recording {
   processedAt DateTime?
   dailyCounterId String?
   DailyCounterEntry DailyCounter? @relation(fields: [dailyCounterId], references: [id])
+  @@index([userId, checksum])
 }
 
 model DailyCounter {

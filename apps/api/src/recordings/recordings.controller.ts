@@ -24,9 +24,7 @@ import * as crypto from "node:crypto";
 const UPLOAD_DIR = path.resolve(__dirname, "..", "uploads");
 
 function ensureUploadsDir() {
-  if (!fs.existsSync(UPLOAD_DIR)) {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  }
+  if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
 @Controller("v1/recordings")
@@ -42,8 +40,8 @@ export class RecordingsController {
   @Post("upload")
   @UseInterceptors(
     FileInterceptor("file", {
-      storage: memoryStorage(), // принимаем файл в память
-      limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+      storage: memoryStorage(),
+      limits: { fileSize: 5 * 1024 * 1024 },
     })
   )
   async upload(
@@ -53,30 +51,19 @@ export class RecordingsController {
     @Body("durationMs") durationMs?: string
   ) {
     const deviceId = (req.headers["x-device-id"] as string) || "unknown";
-
     const hdr = (
       req.headers["x-recog-mode"] as string | undefined
     )?.toLowerCase();
     const recogMode =
       hdr === "arabic" ? "arabic" : hdr === "auto" ? "auto" : "latin";
 
-    console.log("[upload hit]", {
-      hasFile: !!file,
-      size: file?.size,
-      type: file?.mimetype,
-      zikrId,
-      durationMs,
-      deviceId,
-    });
-
     if (!file) throw new BadRequestException("file required");
     if (!zikrId) throw new BadRequestException("zikrId required");
     if (file.size < 1024) throw new BadRequestException("empty audio");
-    if (!file.mimetype?.startsWith("audio/")) {
+    if (!file.mimetype?.startsWith("audio/"))
       throw new BadRequestException("invalid mime");
-    }
 
-    // создаём/ищем пользователя по deviceId
+    // гарантируем пользователя
     const user = await this.prisma.user.upsert({
       where: { deviceId },
       update: {},
@@ -84,22 +71,36 @@ export class RecordingsController {
       select: { id: true },
     });
 
-    // считаем checksum на сервере
+    // считаем checksum прямо по буферу
     const checksum = crypto
       .createHash("sha256")
       .update(file.buffer)
       .digest("hex");
 
-    // сохраняем файл в наш uploads
-    const ext =
-      (file.originalname?.split(".").pop() || "m4a")
-        .toLowerCase()
-        .slice(0, 6) || "m4a";
-    const diskName = `${uuid()}.${ext}`;
+    // 1) Ищем дубликат СРАЗУ (до записи файла на диск!)
+    const dup = await this.service.findDuplicateByChecksum(user.id, checksum);
+    if (dup) {
+      // ничего не пишем, ничего не ставим в очередь
+      return {
+        id: dup.id,
+        status: dup.status,
+        duplicate: true,
+        message: "Already uploaded recently",
+      };
+    }
+
+    // 2) Пишем файл на диск, раз дубликата нет
+    const rawExt = (file.originalname || "").split(".").pop() || "";
+    const safeExt = ["m4a", "wav", "mp3", "aac", "ogg", "webm"].includes(
+      rawExt.toLowerCase()
+    )
+      ? rawExt.toLowerCase()
+      : "m4a";
+    const diskName = `${uuid()}.${safeExt}`;
     const filePath = path.join(UPLOAD_DIR, diskName);
     await fsp.writeFile(filePath, file.buffer);
 
-    // запись в БД
+    // 3) Создаём запись
     const rec = await this.service.createForUser(user.id, {
       checksum,
       zikrId,
@@ -108,15 +109,29 @@ export class RecordingsController {
       durationMs: durationMs ? Number(durationMs) : undefined,
     });
 
-    // ставим в очередь для воркера
-    await this.queues.enqueueProcessingJob({
-      recordingId: rec.id,
-      userId: user.id,
-      zikrId,
-      filePath,
-      durationMs: durationMs ? Number(durationMs) : null,
-      recogMode,
-    });
+    // 4) Кладём в очередь
+    try {
+      await this.queues.enqueueProcessingJob({
+        recordingId: rec.id,
+        userId: user.id,
+        zikrId,
+        filePath,
+        durationMs: durationMs ? Number(durationMs) : null,
+        recogMode,
+      });
+    } catch (e) {
+      // если очередь не доступна — пометим как FAILED,
+      // чтобы фронт сразу увидел реальный статус
+      await this.prisma.recording.update({
+        where: { id: rec.id },
+        data: {
+          status: "FAILED",
+          processedAt: new Date(),
+          text: "queue-error",
+        },
+      });
+      throw e;
+    }
 
     return { id: rec.id, status: rec.status, message: "Queued for processing" };
   }

@@ -3,17 +3,22 @@ const path = require("path");
 const { getDefaultConfig } = require("expo/metro-config");
 
 const projectRoot = __dirname;
-const workspaceRoot = path.resolve(projectRoot, "../..");
+const workspaceRoot = path.resolve(projectRoot, "../.."); // корень монорепы
 
-const config = getDefaultConfig(projectRoot);
+const defaultConfig = getDefaultConfig(projectRoot);
 
-// Монорепа: следим и за корнем (чтобы пакеты из root виделись)
-config.watchFolders = [workspaceRoot];
+module.exports = {
+  ...defaultConfig,
 
-// Разрешение модулей: сперва локальные node_modules приложения, потом корневые
-config.resolver.nodeModulesPaths = [
-  path.resolve(projectRoot, "node_modules"),
-  path.resolve(workspaceRoot, "node_modules"),
-];
+  // ❗ сохраняем дефолт и добавляем свой путь
+  watchFolders: [...(defaultConfig.watchFolders || []), workspaceRoot],
 
-module.exports = config;
+  resolver: {
+    ...defaultConfig.resolver,
+    // ❗ сначала дефолтные пути, затем корневой node_modules монорепы
+    nodeModulesPaths: [
+      ...(defaultConfig.resolver?.nodeModulesPaths || []),
+      path.resolve(workspaceRoot, "node_modules"),
+    ],
+  },
+};

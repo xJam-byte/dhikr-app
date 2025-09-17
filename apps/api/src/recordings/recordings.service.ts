@@ -5,6 +5,23 @@ import { PrismaService } from "../prisma/prisma.service";
 export class RecordingsService {
   constructor(private prisma: PrismaService) {}
 
+  async findDuplicateByChecksum(userId: string, checksum: string) {
+    if (!userId) throw new BadRequestException("Missing userId");
+    if (!checksum) throw new BadRequestException("Missing checksum");
+
+    return this.prisma.recording.findFirst({
+      where: { userId, checksum },
+      select: {
+        id: true,
+        status: true,
+        repeats: true,
+        score: true,
+        text: true,
+      },
+      orderBy: { createdAt: "desc" }, // на всякий
+    });
+  }
+
   async createForUser(
     userId: string,
     dto: {
@@ -19,12 +36,6 @@ export class RecordingsService {
     if (!dto?.checksum) throw new BadRequestException("Missing checksum");
     if (!dto?.zikrId) throw new BadRequestException("Missing zikrId");
 
-    const dup = await this.prisma.recording.findFirst({
-      where: { checksum: dto.checksum, userId },
-      select: { id: true, status: true },
-    });
-    if (dup) return dup;
-
     const rec = await this.prisma.recording.create({
       data: {
         userId,
@@ -32,7 +43,7 @@ export class RecordingsService {
         checksum: dto.checksum,
         filename: dto.filename,
         sizeBytes: dto.sizeBytes,
-        durationMs: dto.durationMs ? Number(dto.durationMs) : undefined,
+        durationMs: dto.durationMs ? Number(dto.durationMs) : null,
         status: "QUEUED",
         text: "",
         score: 0.0,
@@ -56,10 +67,11 @@ export class RecordingsService {
     });
     if (!r) throw new BadRequestException("not_found");
 
+    // Если хочешь, чтобы 0 тоже отображался как 0 — убери Math.max:
     return {
       id: r.id,
       status: r.status,
-      repeats: Math.max(1, r.repeats ?? 1),
+      repeats: r.repeats ?? 0,
       score: r.score ?? undefined,
       text: r.text ?? undefined,
     };

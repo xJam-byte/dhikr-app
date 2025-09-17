@@ -4,15 +4,17 @@ import { Worker } from "bullmq";
 import IORedis from "ioredis";
 import { PrismaClient } from "@prisma/client";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
 import { createAsr } from "../verify/asr";
 import { normalizeText, buildVariantRegex } from "../verify/text-utils";
 import { matchScore } from "../verify/matcher";
 import * as RepeatCounter from "../verify/repeat-counter";
 import { ConfigService } from "../config/config.service";
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Config
-// ──────────────────────────────────────────────────────────────────────────────
+// ✅ единый клиент DTW
+import { dtwCount, hasLocalTemplates } from "../verify/dtw-aligner";
+
 const cfg = new ConfigService();
 
 const REDIS_URL = cfg.redisUrl;
@@ -27,18 +29,18 @@ const asr = createAsr();
 const QUEUE = "processingQueue";
 const JOB = "process-recording";
 
-// concurrency с защитой
+// где лежат аудио-шаблоны
+const TEMPLATES_ROOT_ABS =
+  process.env.TEMPLATES_ROOT_ABS ||
+  path.resolve(__dirname, "..", "assets", "zikr_templates");
+
+// concurrency
 const RAW_CONC = Number((cfg.workerConcurrency as any) ?? NaN);
 const WORKER_CONCURRENCY =
   Number.isFinite(RAW_CONC) && RAW_CONC > 0 ? Math.floor(RAW_CONC) : 2;
-console.log(
-  "[worker] concurrency =",
-  WORKER_CONCURRENCY,
-  "env:",
-  process.env.WORKER_CONCURRENCY
-);
+console.log("[worker] concurrency =", WORKER_CONCURRENCY);
 
-// базовые пороги (жёстко приводим к number)
+// thresholds
 const MIN_MS = Number.isFinite(Number(cfg.minRecordingMs))
   ? Number(cfg.minRecordingMs)
   : 350;
@@ -47,7 +49,6 @@ const DUP_MS = Number.isFinite(Number(cfg.duplicateWindowMs))
   : 2500;
 const MIN_ASR_LEN = 2;
 
-// уверенность ASR
 const MIN_CONF_LATIN = Number.isFinite(Number(cfg.minConfLatin))
   ? Number(cfg.minConfLatin)
   : 0.4;
@@ -55,27 +56,22 @@ const MIN_CONF_AR = Number.isFinite(Number(cfg.minConfAr))
   ? Number(cfg.minConfAr)
   : 0.28;
 
-// верхний жёсткий кэп
 const HARD_CAP = Number.isFinite(Number(cfg.hardCapRepeats))
   ? Number(cfg.hardCapRepeats)
   : 5;
 
-// VAD-хинт для ASR-сервера
 const ASR_VAD_MIN_SIL_MS = Number.isFinite(Number(cfg.asrVadMinSilMs))
   ? Number(cfg.asrVadMinSilMs)
   : 180;
 
-// предпочтительный скрипт
 const DEFAULT_PREFERRED_SCRIPT =
   (cfg.matchPreferredScript as "LATIN" | "AR") || "LATIN";
-
-// ──────────────────────────────────────────────────────────────────────────────
 
 type JobData = {
   recordingId: string;
   userId: string;
   zikrId: string;
-  filePath: string;
+  filePath: string | null | undefined; // обязателен
   durationMs: number | null;
 };
 
@@ -101,20 +97,22 @@ async function safeUnlink(p?: string | null) {
 
 async function fail(id: string, reason: string, text = "", score = 0) {
   console.log("[FAIL]", id, reason);
-  await prisma.recording.update({
-    where: { id },
-    data: { status: "FAILED", processedAt: new Date(), text, score },
-  });
+  try {
+    await prisma.recording.update({
+      where: { id },
+      data: { status: "FAILED", processedAt: new Date(), text, score },
+    });
+  } catch (e) {
+    console.error("[FAIL.update.error]", (e as Error).message);
+  }
 }
 
 function hasArabicChars(s: string) {
   return /[\u0600-\u06FF]/.test(s || "");
 }
-
 function tokenCount(s: string): number {
   return (s || "").trim().split(/\s+/).filter(Boolean).length;
 }
-
 function pickTopVariantByScript<
   T extends { script: string; textNorm: string; priority?: number }
 >(variants: T[], script: "AR" | "LATIN"): string | undefined {
@@ -125,8 +123,6 @@ function pickTopVariantByScript<
   const t = (top?.textNorm || "").trim();
   return t || undefined;
 }
-
-/** мягкий верхний лимит по длительности (НЕ увеличивает счёт) */
 function capByDurationTop(
   repeats: number,
   durationMs: number | null | undefined,
@@ -136,7 +132,6 @@ function capByDurationTop(
   const repN = Number(repeats);
   const dMs = Number(durationMs);
   if (!Number.isFinite(dMs) || dMs < 400) return repN;
-
   const perToken = hasAR ? 260 : 300;
   const tokens = Math.max(
     1,
@@ -146,19 +141,14 @@ function capByDurationTop(
   const top = Math.max(1, Math.floor(dMs / minOneMs));
   return Math.min(repN, top);
 }
-
-/** Точный подсчёт повторов полной фразы (и для spaced, и для tight) */
 function countExactPhraseRepeats(text: string, phrase?: string): number {
   if (!phrase) return 0;
   const haySpaced = normalizeText(text || "");
   if (!haySpaced) return 0;
-
   const needleSpaced = normalizeText(phrase);
   if (!needleSpaced) return 0;
-
   const hayTight = haySpaced.replace(/\s+/g, "");
   const needleTight = needleSpaced.replace(/\s+/g, "");
-
   const countNonOverlap = (hay: string, needle: string) => {
     if (!hay || !needle) return 0;
     let i = 0,
@@ -167,17 +157,14 @@ function countExactPhraseRepeats(text: string, phrase?: string): number {
       const pos = hay.indexOf(needle, i);
       if (pos < 0) break;
       c++;
-      i = pos + needle.length; // неперекрывающиеся (важно для back-to-back)
+      i = pos + needle.length;
     }
     return c;
   };
-
   const a = countNonOverlap(haySpaced, needleSpaced);
   const b = countNonOverlap(hayTight, needleTight);
   return Math.max(a, b);
 }
-
-/** Fallback: подсчёт по regex с фразами */
 function countRepeatsRegex(
   text: string,
   phraseArabic?: string,
@@ -185,9 +172,7 @@ function countRepeatsRegex(
 ) {
   const t = normalizeText(text);
   if (!t) return 0;
-
   const ranges: Array<{ start: number; end: number }> = [];
-
   function collect(re: RegExp) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(t))) {
@@ -198,12 +183,10 @@ function countRepeatsRegex(
       if (m.index === re.lastIndex) re.lastIndex++;
     }
   }
-
   if (phraseArabic)
     collect(buildVariantRegex(normalizeText(phraseArabic), "AR"));
   if (phraseLatin)
     collect(buildVariantRegex(normalizeText(phraseLatin), "LATIN"));
-
   ranges.sort((a, b) => a.start - b.start);
   const merged: typeof ranges = [];
   for (const r of ranges) {
@@ -213,126 +196,109 @@ function countRepeatsRegex(
   }
   return merged.length;
 }
+function countByStrongPatterns(
+  text: string,
+  variants: Array<{ script: string; textNorm: string; anchors?: string[] }>
+): number {
+  if (!text) return 0;
+  const haySpaced = normalizeText(text);
+  const hayTight = haySpaced.replace(/\s+/g, "");
+  const hayIsArabic = /[\u0600-\u06FF]/.test(haySpaced);
 
-function strongPatternsFromVariants(
-  variants: Array<{ textNorm: string; anchors?: string[] }>
-): string[] {
-  const set = new Set<string>();
-
-  const push = (s: string) => {
-    const t = normalizeText(s || "");
-    if (!t) return;
-    set.add(t);
-    set.add(t.replace(/\s+/g, "")); // tight
+  type R = { start: number; end: number };
+  const collectRanges = (hay: string, needles: string[]): R[] => {
+    const out: R[] = [];
+    for (const raw of needles) {
+      const ndl = normalizeText(raw || "");
+      if (!ndl) continue;
+      let i = 0;
+      while (true) {
+        const pos = hay.indexOf(ndl, i);
+        if (pos < 0) break;
+        out.push({ start: pos, end: pos + ndl.length });
+        i = pos + ndl.length;
+      }
+    }
+    return out;
+  };
+  const strictMerge = (ranges: R[]): R[] => {
+    if (ranges.length <= 1) return ranges.slice();
+    const items = ranges.slice().sort((a, b) => a.start - b.start);
+    const out: R[] = [items[0]];
+    for (let i = 1; i < items.length; i++) {
+      const prev = out[out.length - 1];
+      const cur = items[i];
+      if (cur.start < prev.end) prev.end = Math.max(prev.end, cur.end);
+      else out.push({ ...cur });
+    }
+    return out;
   };
 
-  for (const v of variants) {
-    if (v.textNorm) push(v.textNorm);
+  const wantedScript = hayIsArabic ? "AR" : "LATIN";
+  const sameScript = variants.filter((v) => (v.script as any) === wantedScript);
+
+  const primaryNeedles = new Set<string>();
+  const pushNeedle = (s: string) => {
+    const spaced = normalizeText(s);
+    if (!spaced) return;
+    const tight = spaced.replace(/\s+/g, "");
+    primaryNeedles.add(spaced);
+    primaryNeedles.add(tight);
+    if (!hayIsArabic && /[aiu]$/.test(tight)) {
+      primaryNeedles.add(tight.replace(/[aiu]$/, ""));
+    }
+  };
+  for (const v of sameScript) if (v.textNorm) pushNeedle(v.textNorm);
+
+  const coreSpaced = strictMerge(collectRanges(haySpaced, [...primaryNeedles]));
+  const coreTight = strictMerge(collectRanges(hayTight, [...primaryNeedles]));
+  const coreCount = Math.max(coreSpaced.length, coreTight.length);
+  if (coreCount > 0) return coreCount;
+
+  const anchors: string[] = [];
+  for (const v of sameScript) {
     for (const a of v.anchors || []) {
       const n = normalizeText(a || "");
-      if (n.length >= 3) push(n); // опущен порог до 3 — важные AR токены
+      if (n && n.length >= (hayIsArabic ? 2 : 3)) anchors.push(n);
+    }
+  }
+  const synthNeedles = new Set<string>();
+  const addSynth = (parts: string[]) => {
+    const spaced = parts.join(" ");
+    const tight = parts.join("");
+    synthNeedles.add(spaced);
+    synthNeedles.add(tight);
+    if (!hayIsArabic && /[aiu]$/.test(tight)) {
+      synthNeedles.add(tight.replace(/[aiu]$/, ""));
+    }
+  };
+  for (let i = 0; i < anchors.length; i++) {
+    for (let j = i + 1; j < Math.min(anchors.length, i + 3); j++) {
+      addSynth([anchors[i], anchors[j]]);
+      if (j + 1 < anchors.length)
+        addSynth([anchors[i], anchors[j], anchors[j + 1]]);
     }
   }
 
-  return Array.from(set);
+  const aSpaced = strictMerge(collectRanges(haySpaced, [...synthNeedles]));
+  const aTight = strictMerge(collectRanges(hayTight, [...synthNeedles]));
+  return Math.max(aSpaced.length, aTight.length);
 }
 
-/** Подсчёт по сильным паттернам (см. обсуждение) */
-function countByStrongPatterns(text: string, patterns: string[]): number {
-  if (!text || patterns.length === 0) return 0;
+// ──────────────────────────────────────────────────────────────────────────────
 
-  const spaced = normalizeText(text);
-  const tight = spaced.replace(/\s+/g, "");
-
-  const splitTokens = (s: string) => s.trim().split(/\s+/).filter(Boolean);
-  const normPatterns = patterns.map((p) => normalizeText(p)).filter(Boolean);
-  const multi = normPatterns.filter((p) => splitTokens(p).length >= 2);
-  const single = normPatterns.filter((p) => splitTokens(p).length === 1);
-
-  const countForHay = (hay: string): number => {
-    if (!hay) return 0;
-    type R = { start: number; end: number };
-    const collect = (needle: string): R[] => {
-      const out: R[] = [];
-      let i = 0;
-      while (true) {
-        const pos = hay.indexOf(needle, i);
-        if (pos < 0) break;
-        const start = pos;
-        const end = pos + needle.length;
-        out.push({ start, end });
-        i = end; // неперекрывающиеся
-      }
-      return out;
-    };
-
-    const gapTol = 1;
-    let ranges: R[] = [];
-    for (const p of multi) ranges.push(...collect(p));
-    if (ranges.length) {
-      ranges.sort((a, b) => a.start - b.start);
-      const merged: R[] = [ranges[0]];
-      for (let i = 1; i < ranges.length; i++) {
-        const prev = merged[merged.length - 1];
-        const cur = ranges[i];
-        const gap = cur.start - prev.end;
-        if ((gap >= 0 && gap <= gapTol) || cur.start < prev.end) {
-          prev.end = Math.max(prev.end, cur.end);
-        } else {
-          merged.push({ ...cur });
-        }
-      }
-      ranges = merged;
-    }
-
-    // одиночные считаем как отдельные неперекрывающиеся вхождения (без кластеризации),
-    // но игнорируем те, что попали внутрь уже найденных multi
-    const inside = (pos: number) =>
-      ranges.some((r) => pos >= r.start && pos <= r.end);
-
-    let singles: R[] = [];
-    for (const p of single) singles.push(...collect(p));
-    singles.sort((a, b) => a.start - b.start);
-    singles = singles.filter((s) => !inside(s.start) && !inside(s.end));
-
-    ranges.push(...singles);
-
-    if (!ranges.length) return 0;
-    ranges.sort((a, b) => a.start - b.start);
-    const final: R[] = [ranges[0]];
-    for (let i = 1; i < ranges.length; i++) {
-      const prev = final[final.length - 1];
-      const cur = ranges[i];
-      if (cur.start < prev.end) prev.end = Math.max(prev.end, cur.end);
-      else final.push({ ...cur });
-    }
-    return final.length;
-  };
-
-  const cSpaced = countForHay(spaced);
-  const cTight = countForHay(tight);
-  const best = Math.max(cSpaced, cTight);
-  console.log("[strongPatterns.counts]", {
-    spaced: cSpaced,
-    tight: cTight,
-    best,
-  });
-  return best;
-}
-
-async function processJob(data: JobData) {
-  const { recordingId, userId, zikrId, filePath } = data;
-  let { durationMs } = data;
-
-  const DURATION_MS = Number.isFinite(Number(durationMs))
-    ? Number(durationMs)
+async function processJob(job: JobData) {
+  const { recordingId, userId, zikrId, filePath } = job;
+  const DURATION_MS = Number.isFinite(Number(job.durationMs))
+    ? Number(job.durationMs)
     : 0;
+
   console.log("[job]", {
     recordingId,
     userId,
     zikrId,
     durationMs: DURATION_MS,
-    filePath,
+    hasFilePath: !!filePath,
   });
 
   await prisma.recording.update({
@@ -342,7 +308,10 @@ async function processJob(data: JobData) {
 
   if (!Number.isFinite(DURATION_MS) || DURATION_MS < MIN_MS) {
     await fail(recordingId, "too-short");
-    await safeUnlink(filePath);
+    return;
+  }
+  if (!filePath) {
+    await fail(recordingId, "no-filepath-in-job");
     return;
   }
 
@@ -355,7 +324,6 @@ async function processJob(data: JobData) {
   console.log("[variants.count]", variants.length);
   if (!variants.length) {
     await fail(recordingId, "no-variants");
-    await safeUnlink(filePath);
     return;
   }
 
@@ -368,7 +336,44 @@ async function processJob(data: JobData) {
   const tz = user?.timezone || "UTC";
   console.log("[user.level]", userLevel);
 
-  // хинт для ASR
+  // антидубль окно
+  const dupWindow = Number.isFinite(DUP_MS) && DUP_MS > 0 ? DUP_MS : 2500;
+  const gteDate = new Date(Date.now() - dupWindow);
+  const duplicate = await prisma.recording.findFirst({
+    where: { userId, zikrId, status: "DONE", processedAt: { gte: gteDate } },
+    select: { id: true },
+    orderBy: { processedAt: "desc" },
+  });
+  if (duplicate) {
+    await fail(recordingId, "duplicate-window");
+    return;
+  }
+
+  // 0) DTW первым
+  if (await hasLocalTemplates(TEMPLATES_ROOT_ABS, zikrId)) {
+    try {
+      const c = await dtwCount(zikrId, filePath);
+      console.log("[count.by] dtw =", c);
+      if (c >= 1) {
+        const repeats = Math.min(c, HARD_CAP);
+        await finalizeSuccess(
+          repeats,
+          recordingId,
+          userId,
+          zikrId,
+          tz,
+          "",
+          0.95
+        );
+        await safeUnlink(filePath);
+        return;
+      }
+    } catch (e) {
+      console.log("[dtw.error]", (e as Error).message);
+    }
+  }
+
+  // 1) ASR + фоллбэки по тексту
   const hasARvariant = variants.some((v) => (v.script as any) === "AR");
   const preferAR =
     DEFAULT_PREFERRED_SCRIPT === "AR" ||
@@ -376,10 +381,8 @@ async function processJob(data: JobData) {
     user?.language === "ar";
   const langHint = preferAR && hasARvariant ? "ar" : "auto";
 
-  // ASR
   let asrText = "";
   let asrConf = 0;
-  let segCount = 0;
   let hasAR = false;
   let words: Array<{ w: string; start: number; end: number; p?: number }> = [];
   try {
@@ -389,7 +392,6 @@ async function processJob(data: JobData) {
     });
     asrText = (r.text || "").trim();
     asrConf = Number(r.conf || 0);
-    segCount = Number(r.segments_count || 0);
     hasAR = !!r.has_ar || hasArabicChars(asrText);
     words = Array.isArray(r.words) ? r.words : [];
   } catch (e) {
@@ -404,60 +406,27 @@ async function processJob(data: JobData) {
   });
 
   const normText = normalizeText(asrText);
-  if (!normText || normText.length < MIN_ASR_LEN) {
-    await fail(recordingId, "empty-asr", asrText, 0.05);
-    await safeUnlink(filePath);
-    return;
-  }
-
-  // вспомогательный скор
   const m = matchScore({ asrText, userLevel, variants: variants as any });
   console.log("[match]", m);
 
-  // Выбираем топ-1 фразу по приоритету для каждого скрипта
   const phraseLatin = pickTopVariantByScript(variants as any, "LATIN");
   const phraseArabic = pickTopVariantByScript(variants as any, "AR");
-
-  // ворота по уверенности (с мягким override)
   const confGate = hasAR ? MIN_CONF_AR : MIN_CONF_LATIN;
   const allowLowConf = m?.ok && (m?.score ?? 0) >= 1.0;
-  if ((!Number.isFinite(asrConf) || asrConf < confGate) && !allowLowConf) {
-    await fail(recordingId, "low-conf", asrText, m.score ?? 0.2);
-    await safeUnlink(filePath);
-    return;
-  }
-  if (allowLowConf && asrConf < confGate) {
-    console.log(
-      "[low-conf override] conf:",
-      asrConf,
-      "gate:",
-      confGate,
-      "score:",
-      m.score
-    );
-  }
 
-  // Подсчёт повторов
   const durationSec = DURATION_MS / 1000;
-
   let repeatsNum = 0;
 
-  // 0) Самый надёжный: точные повторы ПОЛНОЙ фразы (и AR, и LAT) на spaced/tight
   const exactLatin = countExactPhraseRepeats(asrText, phraseLatin);
   const exactArabic = countExactPhraseRepeats(asrText, phraseArabic);
   const exactBest = Math.max(exactLatin, exactArabic);
   if (exactBest > 0) {
     repeatsNum = exactBest;
-    console.log("[repeats.exactPhrase]", {
-      exactLatin,
-      exactArabic,
-      exactBest,
-    });
+    console.log("[count.by] exactPhrase =", repeatsNum);
   } else if (
     words.length > 0 &&
     typeof RepeatCounter.countRepeatsUnified === "function"
   ) {
-    // 1) По словам (если пришли word timestamps)
     const intervals = RepeatCounter.countRepeatsUnified(
       words,
       phraseArabic,
@@ -465,43 +434,28 @@ async function processJob(data: JobData) {
       durationSec
     );
     repeatsNum = intervals.length;
-    console.log("[repeats.byWords]", repeatsNum);
-  } else {
-    // 2) Регексы по фразам
+    console.log("[count.by] words =", repeatsNum);
+  } else if (normText && normText.length >= MIN_ASR_LEN) {
     repeatsNum = countRepeatsRegex(asrText, phraseArabic, phraseLatin);
-    console.log("[repeats.regexFallback]", repeatsNum);
-
-    // 3) Сильные паттерны из всех variants (фраза + anchors)
+    console.log("[count.by] regex =", repeatsNum);
     if (repeatsNum < 1) {
-      const strong = strongPatternsFromVariants(variants as any);
-      const r2 = countByStrongPatterns(asrText, strong);
+      const r2 = countByStrongPatterns(asrText, variants as any);
       if (r2 > 0) {
         repeatsNum = r2;
-        console.log("[repeats.strongPatterns]", repeatsNum);
+        console.log("[count.by] strongPatterns =", repeatsNum);
       }
     }
   }
 
-  // если 0, но матч высокий — ещё раз по сильным паттернам
-  if (
-    (!Number.isFinite(repeatsNum) || repeatsNum < 1) &&
-    (m.ok || (m.score ?? 0) > 0.85)
-  ) {
-    const strong = strongPatternsFromVariants(variants as any);
-    const r3 = countByStrongPatterns(asrText, strong);
-    if (r3 > (repeatsNum || 0)) {
-      repeatsNum = r3;
-      console.log("[fallback.strongRetry]", repeatsNum);
-    }
-  }
-
   if (!Number.isFinite(repeatsNum) || repeatsNum < 1) {
+    if ((!Number.isFinite(asrConf) || asrConf < confGate) && !allowLowConf) {
+      await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
+      return;
+    }
     await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
-    await safeUnlink(filePath);
     return;
   }
 
-  // ограничим сверху длительностью (не увеличиваем!)
   const minVariantTokens = Math.min(
     ...variants.map((v) => tokenCount(v.textNorm || "") || 1)
   );
@@ -511,33 +465,32 @@ async function processJob(data: JobData) {
     hasAR,
     minVariantTokens
   );
-
-  // жёсткий кэп
   const repeats = Math.min(Number(repeatsCapped), HARD_CAP);
 
   console.log("[repeats.final]", repeats, hasAR ? "(AR)" : "(LATIN)");
 
-  // антидубль-окно
-  const dupWindow = Number.isFinite(DUP_MS) && DUP_MS > 0 ? DUP_MS : 2500;
-  const gteDate = new Date(Date.now() - dupWindow);
+  await finalizeSuccess(
+    repeats,
+    recordingId,
+    userId,
+    zikrId,
+    tz,
+    asrText,
+    m.score ?? 0.85
+  );
+  await safeUnlink(filePath);
+}
 
-  const duplicate = await prisma.recording.findFirst({
-    where: {
-      userId,
-      zikrId,
-      status: "DONE",
-      processedAt: { gte: gteDate },
-    },
-    select: { id: true },
-    orderBy: { processedAt: "desc" },
-  });
-  if (duplicate) {
-    await fail(recordingId, "duplicate-window", asrText, m.score ?? 0.8);
-    await safeUnlink(filePath);
-    return;
-  }
-
-  // фиксация и инкременты (атомарно)
+async function finalizeSuccess(
+  repeats: number,
+  recordingId: string,
+  userId: string,
+  zikrId: string,
+  tz: string,
+  asrText: string,
+  score: number
+) {
+  console.log("[db.tx] start", { repeats, recordingId, userId, zikrId });
   const dayStart = dayStartUtcForTz(new Date(), tz);
 
   await prisma.$transaction(async (tx) => {
@@ -547,7 +500,7 @@ async function processJob(data: JobData) {
         status: "DONE",
         processedAt: new Date(),
         text: asrText,
-        score: m.score ?? 0.85,
+        score,
         repeats,
       },
     });
@@ -557,6 +510,7 @@ async function processJob(data: JobData) {
       update: { count: { increment: repeats } },
       create: { userId, date: dayStart, count: repeats },
     });
+
     await tx.totalCounter.upsert({
       where: { userId },
       update: { total: { increment: repeats } },
@@ -591,10 +545,9 @@ async function processJob(data: JobData) {
     }
   });
 
-  await safeUnlink(filePath);
+  console.log("[db.tx] done");
 }
 
-// ————————————————————————————————————————————
 new Worker(
   QUEUE,
   async (job) => {
