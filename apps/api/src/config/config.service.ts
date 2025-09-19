@@ -39,7 +39,7 @@ export class ConfigService {
 
   // ── ASR hints (для python-сервиса; прокидываются из воркера) ───────────────
   get asrVadMinSilMs() {
-    return this.num("ASR_VAD_MIN_SIL_MS", 180);
+    return this.num("ASR_VAD_MIN_SIL_MS", 140);
   }
 
   // ── Пороги уверенности ASR (лат/араб) ──────────────────────────────────────
@@ -47,7 +47,7 @@ export class ConfigService {
     return this.num("MIN_CONF_LATIN", 0.4);
   }
   get minConfAr() {
-    return this.num("MIN_CONF_AR", 0.28);
+    return this.num("MIN_CONF_AR", 0.24);
   }
 
   // ── Подсчёт повторов (repeat-counter) ──────────────────────────────────────

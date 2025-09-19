@@ -1,16 +1,11 @@
-import {
-  normalizeArabic,
-  normalizeLatinRu,
-  hasArabic,
-  toPhraseWords,
-} from "./text-utils";
+import { normalizeArabic, normalizeLatinRu, toPhraseWords } from "./text-utils";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Типы
 // ──────────────────────────────────────────────────────────────────────────────
 
 export type AsrWord = {
-  w: string; // слово (как распозналось)
+  w: string; // слово (как распозналось, уже нормализуем ниже)
   start: number; // сек
   end: number; // сек
   p?: number; // вероятность слова (0..1)
@@ -21,11 +16,13 @@ export type RepeatInterval = { start: number; end: number; prob: number };
 export type Script = "AR" | "LATIN_RU";
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Параметры устойчивости (через ENV)
+// Параметры (ENV) + флаги
 // ──────────────────────────────────────────────────────────────────────────────
 
 const envNum = (key: string, def: number) =>
   Number.isFinite(Number(process.env[key])) ? Number(process.env[key]) : def;
+
+const ADAPTIVE_ENABLED = process.env.REPEAT_ADAPTIVE_ENABLED === "1";
 
 export const MIN_REPEAT_DURATION_MS = envNum("MIN_REPEAT_DURATION_MS", 700);
 export const MIN_GAP_BETWEEN_REPEATS_MS = envNum(
@@ -34,6 +31,9 @@ export const MIN_GAP_BETWEEN_REPEATS_MS = envNum(
 );
 export const MAX_WORD_SKIP = envNum("MAX_WORD_SKIP", 1);
 export const MIN_AVG_WORD_PROB = Number(process.env.MIN_AVG_WORD_PROB ?? 0.35);
+
+// новое независимое «окно невосприимчивости» (после зачёта повтора)
+export const REFRACTORY_WINDOW_MS = envNum("REFRACTORY_WINDOW_MS", 300);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Нормализация токенов
@@ -57,22 +57,81 @@ function toPhrase(text: string, script: Script): string[] {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Подсчёт повторов по словам (FSM)
+/** Вспомогательные адаптивные эвристики */
+// ──────────────────────────────────────────────────────────────────────────────
+
+// медианная длительность слова по всему списку (мс)
+function medianWordMs(words: AsrWord[]): number | undefined {
+  if (!words?.length) return undefined;
+  const arr = words
+    .map((w) => Math.max(0, (w.end - w.start) * 1000))
+    .filter((v) => Number.isFinite(v) && v > 0)
+    .sort((a, b) => a - b);
+  if (!arr.length) return undefined;
+  const m = Math.floor(arr.length / 2);
+  return arr.length % 2 ? arr[m] : (arr[m - 1] + arr[m]) / 2;
+}
+
+// адаптивное мин. время повтора по длине фразы (в словах)
+function minRepeatByWords(wordsCount: number): number {
+  if (wordsCount <= 3) return 520; // 480–560ms зона
+  if (wordsCount <= 7) return 740; // 650–820ms зона
+  return 1000; // 900–1200ms зона
+}
+
+// адаптивный minGap по темпу речи
+function minGapByTempo(medianMs?: number): number {
+  const base = 220;
+  if (!medianMs || !Number.isFinite(medianMs)) return base;
+  return Math.max(base, Math.round(0.25 * medianMs));
+}
+
+// адаптивное число "мусорных" слов внутри фразы
+function allowedSkips(script: Script, phraseLen: number): number {
+  if (!ADAPTIVE_ENABLED) return MAX_WORD_SKIP;
+  if (script === "AR") return phraseLen >= 6 ? 2 : 1;
+  // LATIN/RU — обычно аккуратнее распознаётся
+  return phraseLen >= 8 ? 2 : 1;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Подсчёт повторов по словам (FSM) — улучшенная версия с адаптацией
 // ──────────────────────────────────────────────────────────────────────────────
 
 /**
  * Считает повторы фразы в потоке слов.
  * - Без перекрытий
- * - Допускает до MAX_WORD_SKIP «мусорных» токенов внутри
- * - Требует MIN_REPEAT_DURATION_MS и MIN_AVG_WORD_PROB
+ * - Допускает до MAX_WORD_SKIP/адаптивно «мусорных» токенов внутри
+ * - Требует MIN_REPEAT_DURATION_MS (или адаптивный) и MIN_AVG_WORD_PROB
+ * - Независимое REFRACTORY_WINDOW_MS защищает от «слипания»
  */
 export function countRepeatsFromWords(
   wordsRaw: AsrWord[],
-  phraseWords: string[]
+  phraseWords: string[],
+  // необязательные хинты: скрипт и предрасчитанная медиана длительности слова
+  opts?: { scriptHint?: Script; medianWordMsHint?: number }
 ): RepeatInterval[] {
   const words = wordsRaw;
   const result: RepeatInterval[] = [];
   if (!words.length || !phraseWords.length) return result;
+
+  const phraseLen = phraseWords.length;
+  const medMs =
+    opts?.medianWordMsHint ??
+    // медиана по всему списку слов — быстро и достаточно стабильно
+    medianWordMs(words);
+
+  const minRepeatMs = ADAPTIVE_ENABLED
+    ? minRepeatByWords(phraseLen)
+    : MIN_REPEAT_DURATION_MS;
+
+  const minGapMs = ADAPTIVE_ENABLED
+    ? minGapByTempo(medMs)
+    : MIN_GAP_BETWEEN_REPEATS_MS;
+
+  const refractoryMs = REFRACTORY_WINDOW_MS;
+
+  const skipLimit = allowedSkips(opts?.scriptHint ?? "LATIN_RU", phraseLen);
 
   let i = 0;
   while (i < words.length) {
@@ -100,7 +159,7 @@ export function countRepeatsFromWords(
       } else {
         // допускаем немного «мусора» между словами фразы
         skipped++;
-        if (skipped > MAX_WORD_SKIP) break;
+        if (skipped > skipLimit) break;
         j++;
       }
     }
@@ -111,17 +170,16 @@ export function countRepeatsFromWords(
       ? probs.reduce((a, b) => a + b, 0) / probs.length
       : 0;
 
-    if (
-      matched &&
-      durMs >= MIN_REPEAT_DURATION_MS &&
-      avgProb >= MIN_AVG_WORD_PROB
-    ) {
-      // проверка зазора с предыдущим
+    if (matched && durMs >= minRepeatMs && avgProb >= MIN_AVG_WORD_PROB) {
+      // проверка зазора с предыдущим — ДВА условия:
+      // 1) независимое «окно невосприимчивости» (refractory)
+      // 2) минимальный разрыв между повторами (minGap)
       const prev = result.at(-1);
-      const gapMs = prev
+      const sincePrevStartMs = prev
         ? wStart * 1000 - prev.end * 1000
         : Number.POSITIVE_INFINITY;
-      if (gapMs >= MIN_GAP_BETWEEN_REPEATS_MS) {
+
+      if (sincePrevStartMs >= refractoryMs && sincePrevStartMs >= minGapMs) {
         result.push({ start: wStart, end: wEnd, prob: avgProb });
         i = j; // прыгаем к концу матча, исключая overlap
         continue;
@@ -178,7 +236,8 @@ export function countRepeatsFromWordsForScript(
 ): RepeatInterval[] {
   const normWords = normalizeWords(words, script);
   const phrase = toPhrase(phraseText, script);
-  return countRepeatsFromWords(normWords, phrase);
+  // передаём хинт скрипта, чтобы адаптивно выбрать skipLimit
+  return countRepeatsFromWords(normWords, phrase, { scriptHint: script });
 }
 
 /** Агрегатор по двум скриптам + ограничение по длительности. */

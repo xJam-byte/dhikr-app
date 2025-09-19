@@ -1,9 +1,10 @@
 import { PrismaClient } from "@prisma/client";
-import { normalizeText } from "../verify/text-utils";
+import { normalizeText } from "src/verify/text-utils";
 
 const prisma = new PrismaClient();
 type Script = "AR" | "LATIN" | "RU";
 
+// ──────────────────────────────────────────────────────────────────────────────
 // Быстрая нормализация
 const norm = (s: string) => normalizeText(s || "");
 
@@ -93,7 +94,7 @@ function anchorsFromText(text: string, script: Script): string[] {
   tokens = tokens.filter((t) => t.length >= 3);
   if (!tokens.length) return [];
 
-  if (script === "AR") return tokens.slice(0, 2); // ⬅️ было 1, делаем 2
+  if (script === "AR") return tokens.slice(0, 2);
   if (script === "RU") return tokens.slice(0, 2);
   return latinAnchors(text);
 }
@@ -169,7 +170,7 @@ export async function seedBasicVariants() {
       }
     }
 
-    // EN → тоже LATIN
+    // EN → тоже LATIN (низкий приоритет)
     if (enRaw) {
       const textNorm = norm(enRaw);
       if (textNorm) {
@@ -217,6 +218,7 @@ export async function seedBasicVariants() {
     for (const it of items) {
       await prisma.zikrVariant.upsert({
         where: {
+          // нужен составной уникальный индекс на (zikrId, script, textNorm)
           zikrId_script_textNorm: {
             zikrId: z.id,
             script: it.script as any,
@@ -245,3 +247,20 @@ export async function seedBasicVariants() {
 
   console.log(`✅ seed variants done. upserted: ${upserted}`);
 }
+
+async function main() {
+  console.log("⚠️  clearing zikrVariant...");
+  await prisma.zikrVariant.deleteMany({});
+  console.log("➡️  reseeding variants...");
+  await seedBasicVariants();
+  console.log("🎉 done");
+}
+
+main()
+  .catch((e) => {
+    console.error("❌ seed error:", e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });

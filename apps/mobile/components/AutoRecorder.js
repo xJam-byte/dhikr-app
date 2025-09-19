@@ -10,8 +10,8 @@ import API from "../api";
 const VAD = {
   meteringThresholdDb: -50,
   minSpeechMs: 320, // было 400
-  silenceMs: 420, // было 800 → быстрее финализируем чанк
-  maxChunkMs: 5500, // чуть короче
+  silenceMs: 300, // было 800 → быстрее финализируем чанк
+  maxChunkMs: 3500, // чуть короче
   minVoiceStreakMs: 120,
   progressUpdateMs: 120,
   postSuccessMuteMs: 1200,

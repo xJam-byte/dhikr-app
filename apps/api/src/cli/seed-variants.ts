@@ -7,7 +7,7 @@ seedBasicVariants()
     console.log("✅ seed CLI finished");
     process.exit(0);
   })
-  .catch((e) => {
+  .catch((e: unknown) => {
     console.error("❌ seed CLI error", e);
     process.exit(1);
   });

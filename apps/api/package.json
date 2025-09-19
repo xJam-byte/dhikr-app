@@ -12,7 +12,8 @@
     "prisma:generate": "prisma generate --schema ../../packages/db/prisma/schema.prisma",
     "prisma:migrate": "prisma migrate dev --schema ../../packages/db/prisma/schema.prisma",
     "prisma:studio": "prisma studio --schema ../../packages/db/prisma/schema.prisma",
-    "worker:processing": "ts-node -r tsconfig-paths/register src/workers/processing.worker.ts"
+    "worker:processing": "ts-node -r tsconfig-paths/register src/workers/processing.worker.ts",
+    "upsert:alhamdulillah": "ts-node -r tsconfig-paths/register src/cli/upsert-alhamdulillah-tight.ts"
   },
   "dependencies": {
     "@bull-board/api": "^5.21.4",

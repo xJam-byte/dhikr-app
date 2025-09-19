@@ -12,7 +12,7 @@ import { matchScore } from "../verify/matcher";
 import * as RepeatCounter from "../verify/repeat-counter";
 import { ConfigService } from "../config/config.service";
 
-// ✅ единый клиент DTW
+// ✅ DTW aligner
 import { dtwCount, hasLocalTemplates } from "../verify/dtw-aligner";
 
 const cfg = new ConfigService();
@@ -67,6 +67,49 @@ const ASR_VAD_MIN_SIL_MS = Number.isFinite(Number(cfg.asrVadMinSilMs))
 const DEFAULT_PREFERRED_SCRIPT =
   (cfg.matchPreferredScript as "LATIN" | "AR") || "LATIN";
 
+// ── Флаги/пороги гонки и sanity ──────────────────────────────────────────────
+const RACE_ALIGNER_ASR = process.env.RACE_ALIGNER_ASR === "1";
+const ALIGNER_PRIMARY_TIMEOUT_MS = Number.isFinite(
+  Number(process.env.ALIGNER_PRIMARY_TIMEOUT_MS)
+)
+  ? Number(process.env.ALIGNER_PRIMARY_TIMEOUT_MS)
+  : 900;
+const ASR_PRIMARY_TIMEOUT_MS = Number.isFinite(
+  Number(process.env.ASR_PRIMARY_TIMEOUT_MS)
+)
+  ? Number(process.env.ASR_PRIMARY_TIMEOUT_MS)
+  : 1500;
+
+// DTW sanity
+const DTW_MIN_DURATION_MS = Number.isFinite(
+  Number(process.env.DTW_MIN_DURATION_MS)
+)
+  ? Number(process.env.DTW_MIN_DURATION_MS)
+  : 1200; // слишком короткие сегменты не принимаем DTW'ом
+const ASR_SANITY_TIMEOUT_MS = Number.isFinite(
+  Number(process.env.ASR_SANITY_TIMEOUT_MS)
+)
+  ? Number(process.env.ASR_SANITY_TIMEOUT_MS)
+  : 600;
+const ASR_SANITY_MIN_CONF = Number.isFinite(
+  Number(process.env.ASR_SANITY_MIN_CONF)
+)
+  ? Number(process.env.ASR_SANITY_MIN_CONF)
+  : 0.18;
+
+// StrongPatterns cap при отсутствии слов
+const STRONG_PATTERNS_SINGLE_MAX = Number.isFinite(
+  Number(process.env.STRONG_PATTERNS_SINGLE_MAX)
+)
+  ? Number(process.env.STRONG_PATTERNS_SINGLE_MAX)
+  : 1;
+
+// Арабский → латиница fallback
+const ENABLE_AR_TO_LATIN_FALLBACK =
+  process.env.ENABLE_AR_TO_LATIN_FALLBACK !== "0";
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 type JobData = {
   recordingId: string;
   userId: string;
@@ -113,16 +156,22 @@ function hasArabicChars(s: string) {
 function tokenCount(s: string): number {
   return (s || "").trim().split(/\s+/).filter(Boolean).length;
 }
+
+// ==== LATINISH = LATIN ИЛИ RU ===============================================
 function pickTopVariantByScript<
   T extends { script: string; textNorm: string; priority?: number }
->(variants: T[], script: "AR" | "LATIN"): string | undefined {
+>(variants: T[], script: "AR" | "LATINISH"): string | undefined {
+  const match = (s: string) =>
+    script === "AR" ? s === "AR" : s === "LATIN" || s === "RU";
   const pool = variants
-    .filter((v) => (v.script as any) === script)
+    .filter((v) => match(v.script as any))
     .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
   const top = pool[0];
   const t = (top?.textNorm || "").trim();
   return t || undefined;
 }
+// ============================================================================
+
 function capByDurationTop(
   repeats: number,
   durationMs: number | null | undefined,
@@ -141,6 +190,7 @@ function capByDurationTop(
   const top = Math.max(1, Math.floor(dMs / minOneMs));
   return Math.min(repN, top);
 }
+
 function countExactPhraseRepeats(text: string, phrase?: string): number {
   if (!phrase) return 0;
   const haySpaced = normalizeText(text || "");
@@ -165,6 +215,7 @@ function countExactPhraseRepeats(text: string, phrase?: string): number {
   const b = countNonOverlap(hayTight, needleTight);
   return Math.max(a, b);
 }
+
 function countRepeatsRegex(
   text: string,
   phraseArabic?: string,
@@ -196,6 +247,7 @@ function countRepeatsRegex(
   }
   return merged.length;
 }
+
 function countByStrongPatterns(
   text: string,
   variants: Array<{ script: string; textNorm: string; anchors?: string[] }>
@@ -234,8 +286,9 @@ function countByStrongPatterns(
     return out;
   };
 
-  const wantedScript = hayIsArabic ? "AR" : "LATIN";
-  const sameScript = variants.filter((v) => (v.script as any) === wantedScript);
+  const sameScript = variants.filter((v) =>
+    hayIsArabic ? v.script === "AR" : v.script === "LATIN" || v.script === "RU"
+  );
 
   const primaryNeedles = new Set<string>();
   const pushNeedle = (s: string) => {
@@ -284,6 +337,141 @@ function countByStrongPatterns(
   const aTight = strictMerge(collectRanges(hayTight, [...synthNeedles]));
   return Math.max(aSpaced.length, aTight.length);
 }
+
+// ── Транслитерация AR → LATIN кандидатов (минимально достаточная) ───────────
+function generateLatinCandidatesFromArabic(ar: string): string[] {
+  if (!ENABLE_AR_TO_LATIN_FALLBACK) return [];
+  const src = normalizeText(ar);
+  if (!src) return [];
+
+  // частые целые слова
+  let s = src
+    .replace(/الل?ه/g, "allah")
+    .replace(/إ|أ|آ/g, "a")
+    .replace(/ء/g, "")
+    .replace(/ى/g, "a")
+    .replace(/ة/g, "a");
+
+  // посимвольная замена (грубая, но стабильная)
+  const map: Record<string, string> = {
+    ا: "a",
+    ب: "b",
+    ت: "t",
+    ث: "th",
+    ج: "j",
+    ح: "h",
+    خ: "kh",
+    د: "d",
+    ذ: "dh",
+    ر: "r",
+    ز: "z",
+    س: "s",
+    ش: "sh",
+    ص: "s",
+    ض: "d",
+    ط: "t",
+    ظ: "z",
+    ع: "a",
+    غ: "gh",
+    ف: "f",
+    ق: "q",
+    ك: "k",
+    ل: "l",
+    م: "m",
+    ن: "n",
+    ه: "h",
+    و: "w",
+    ي: "y",
+    لا: "la",
+  };
+
+  s = s
+    .split("")
+    .map((ch) => map[ch] ?? ch)
+    .join("");
+
+  // несколько вариантов финализации (удаляем гласную в конце, двойные буквы)
+  const base = s.replace(/\s+/g, " ").trim();
+  const cands = new Set<string>([
+    base,
+    base.replace(/(a|i|u)\b/g, ""),
+    base.replace(/hh/g, "h").replace(/aa/g, "a").replace(/ii/g, "i"),
+  ]);
+  return [...cands].filter(Boolean);
+}
+
+function countExactFromCandidates(text: string, candidates: string[]): number {
+  if (!text) return 0;
+  const hay = text;
+  let maxC = 0;
+  for (const n of candidates) {
+    const c = countExactPhraseRepeats(hay, n);
+    if (c > maxC) maxC = c;
+  }
+  return maxC;
+}
+
+function countExactFromVariants(
+  text: string,
+  variants: Array<{ script: string; textNorm: string }>
+): number {
+  if (!text) return 0;
+  const needles = variants
+    .filter((v) => v.textNorm && (v.script === "LATIN" || v.script === "RU"))
+    .map((v) => v.textNorm);
+  if (!needles.length) return 0;
+  return countExactFromCandidates(text, needles);
+}
+
+// NEW: считаем повторы по сегментам ASR (каждый сегмент = мах. 1 совпадение)
+function countFromSegments(
+  segments: string[] | undefined,
+  phraseArabic?: string,
+  phraseLatin?: string
+): number {
+  if (!segments?.length) return 0;
+  const reAr = phraseArabic
+    ? buildVariantRegex(normalizeText(phraseArabic), "AR")
+    : null;
+  const reLat = phraseLatin
+    ? buildVariantRegex(normalizeText(phraseLatin), "LATIN")
+    : null;
+  let c = 0;
+  for (const raw of segments) {
+    const s = normalizeText(raw || "");
+    if (!s) continue;
+    if ((reAr && reAr.test(s)) || (reLat && reLat.test(s))) c++;
+  }
+  return c;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// helpers for race
+// ──────────────────────────────────────────────────────────────────────────────
+
+function withTimeout<T>(p: Promise<T>, ms: number, tag: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${tag}:timeout`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
+type AsrResultShape = {
+  text: string;
+  conf: number;
+  has_ar: boolean;
+  words: Array<{ w: string; start: number; end: number; p?: number }>;
+  segments?: string[]; // ⬅️ NEW
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -349,24 +537,408 @@ async function processJob(job: JobData) {
     return;
   }
 
-  // 0) DTW первым
+  // ПОДГОТОВКА К ГОНКЕ: есть ли локальные templates
+  const templatesAvailable = await hasLocalTemplates(
+    TEMPLATES_ROOT_ABS,
+    zikrId
+  );
+
+  // параметры пользователя для ASR
+  const hasARvariant = variants.some((v) => v.script === "AR");
+  const preferAR =
+    DEFAULT_PREFERRED_SCRIPT === "AR" ||
+    userLevel === "ADVANCED" ||
+    user?.language === "ar";
+  const langHint = preferAR && hasARvariant ? "ar" : "auto";
+
+  // функция: запустить ASR с таймаутом и вернуть полный результат
+  const runASR = async (): Promise<AsrResultShape> => {
+    const r: any = await (asr as any).transcribe(filePath, {
+      lang: langHint,
+      vadMinSilMs: ASR_VAD_MIN_SIL_MS,
+    });
+    return {
+      text: (r.text || "").trim(),
+      conf: Number(r.conf || 0),
+      has_ar: !!r.has_ar || hasArabicChars(r.text || ""),
+      words: Array.isArray(r.words) ? r.words : [],
+      segments: Array.isArray(r.segments) ? r.segments : undefined, // ⬅️ NEW
+    };
+  };
+
+  // функция: запустить DTW и вернуть число повторов
+  const runDTW = async (): Promise<number> => {
+    const c = await dtwCount(zikrId, filePath);
+    return Number.isFinite(Number(c)) ? Number(c) : 0;
+  };
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Вариант А: гонка включена и есть шаблоны → параллельно
+  // Вариант Б: последовательный fallback (DTW → ASR)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  if (RACE_ALIGNER_ASR && templatesAvailable) {
+    console.log("[race] enabled");
+
+    const dtwPromise = withTimeout(runDTW(), ALIGNER_PRIMARY_TIMEOUT_MS, "dtw");
+    const asrPromise = withTimeout(runASR(), ASR_PRIMARY_TIMEOUT_MS, "asr");
+
+    // «врата» для DTW: принимаем только если >=1
+    const dtwGate = dtwPromise.then((c) => {
+      if (c >= 1) return { winner: "dtw" as const, repeats: c };
+      return new Promise<never>(() => {});
+    });
+
+    let winner: "dtw" | "asr" | null = null;
+    let asrRes: AsrResultShape | null = null;
+    let dtwRes: number | null = null;
+
+    try {
+      const first = await Promise.race([dtwGate, asrPromise]);
+      if ((first as any).winner === "dtw") {
+        winner = "dtw";
+        dtwRes = (first as any).repeats as number;
+      } else {
+        winner = "asr";
+        asrRes = first as AsrResultShape;
+      }
+    } catch (e) {
+      console.log("[race.first.error]", (e as Error).message);
+    }
+
+    // ── DTW первым → sanity-gate перед зачётом ─────────────────────────────
+    if (winner === "dtw" && dtwRes != null) {
+      if (DURATION_MS < DTW_MIN_DURATION_MS) {
+        console.log("[dtw.gate] too-short-for-dtw accept => fallback to ASR");
+      } else {
+        let asrSanity: AsrResultShape | null = null;
+        try {
+          asrSanity = await withTimeout(
+            runASR(),
+            ASR_SANITY_TIMEOUT_MS,
+            "asr.sanity"
+          );
+        } catch (e) {
+          console.log(
+            "[dtw.gate] asr.sanity timeout/error =>",
+            (e as Error).message
+          );
+        }
+
+        const sanityText = asrSanity?.text?.trim() || "";
+        const sanityWords = asrSanity?.words?.length ?? 0;
+        const sanityConf = Number(asrSanity?.conf ?? 0);
+
+        const phraseLatin = pickTopVariantByScript(variants as any, "LATINISH");
+        const phraseArabic = pickTopVariantByScript(variants as any, "AR");
+
+        let textSignals = 0;
+        if (sanityText) {
+          const exactAny = Math.max(
+            countExactPhraseRepeats(sanityText, phraseLatin),
+            countExactPhraseRepeats(sanityText, phraseArabic)
+          );
+          if (exactAny > 0) textSignals++;
+
+          const regexAny = countRepeatsRegex(
+            sanityText,
+            phraseArabic,
+            phraseLatin
+          );
+          if (regexAny > 0) textSignals++;
+
+          if (textSignals === 0) {
+            const strongAny = countByStrongPatterns(
+              sanityText,
+              variants as any
+            );
+            if (strongAny > 0) textSignals++;
+          }
+        }
+
+        const looksLikeZikr =
+          sanityWords >= 2 ||
+          textSignals > 0 ||
+          sanityConf >= ASR_SANITY_MIN_CONF;
+
+        if (looksLikeZikr) {
+          const repeats = Math.min(dtwRes, HARD_CAP);
+          console.log("[count.by] dtw (race,gated) =", repeats, {
+            sanityWords,
+            textSignals,
+            sanityConf: +sanityConf.toFixed(3),
+          });
+          await finalizeSuccess(
+            repeats,
+            recordingId,
+            userId,
+            zikrId,
+            tz,
+            sanityText,
+            0.95
+          );
+          await safeUnlink(filePath);
+          return;
+        } else {
+          console.log(
+            "[dtw.gate] rejected (noise/normal speech) => fallback to ASR",
+            {
+              sanityWords,
+              textSignals,
+              sanityConf: +sanityConf.toFixed(3),
+            }
+          );
+        }
+      }
+      // если сюда дошли — не приняли DTW, идём по ASR ниже
+    }
+
+    // ── ASR победил в гонке или DTW отклонён ────────────────────────────────
+    if (!asrRes) {
+      try {
+        asrRes = await asrPromise;
+      } catch (e) {
+        console.log("[race.asr.after.error]", (e as Error).message);
+      }
+    }
+
+    if (asrRes) {
+      const {
+        text: asrText,
+        conf: asrConf,
+        has_ar: hasAR,
+        words,
+        segments,
+      } = asrRes;
+
+      console.log("[asr]", {
+        text: asrText,
+        conf: asrConf,
+        langHint,
+        has_ar: hasAR,
+        words: words.length,
+        segments: Array.isArray(segments) ? segments.length : 0,
+      });
+
+      const m = matchScore({ asrText, userLevel, variants: variants as any });
+      console.log("[match]", m);
+
+      const phraseLatin = pickTopVariantByScript(variants as any, "LATINISH");
+      const phraseArabic = pickTopVariantByScript(variants as any, "AR");
+      const confGate = hasAR ? MIN_CONF_AR : MIN_CONF_LATIN;
+      const allowLowConf = m?.ok && (m?.score ?? 0) >= 1.0;
+
+      const durationSec = DURATION_MS / 1000;
+
+      const exactBest = Math.max(
+        countExactPhraseRepeats(asrText, phraseLatin),
+        countExactPhraseRepeats(asrText, phraseArabic)
+      );
+
+      // ⬅️ NEW: пробуем по сегментам ДО слов
+      let repeatsNum = 0;
+      const segRepeats = countFromSegments(segments, phraseArabic, phraseLatin);
+      if (segRepeats > 0) {
+        repeatsNum = segRepeats;
+        console.log("[count.by] segments =", repeatsNum);
+      } else if (exactBest > 0) {
+        repeatsNum = exactBest;
+        console.log("[count.by] exactPhrase =", repeatsNum);
+      } else if (words.length > 0) {
+        const intervals = RepeatCounter.countRepeatsUnified(
+          words,
+          phraseArabic,
+          phraseLatin,
+          durationSec
+        );
+        repeatsNum = intervals.length;
+        console.log("[count.by] words =", repeatsNum);
+      } else if (normalizeText(asrText).length >= MIN_ASR_LEN) {
+        let byRegex = countRepeatsRegex(asrText, phraseArabic, phraseLatin);
+        console.log("[count.by] regex =", byRegex);
+
+        // 1) exact по всем LATIN/RU вариантам
+        let byExactAny = 0;
+        if (byRegex < 1 && words.length === 0) {
+          byExactAny = countExactFromVariants(asrText, variants as any);
+          if (byExactAny > 0) {
+            console.log("[count.by] exact.any.variants =", byExactAny);
+          }
+        }
+
+        // 2) если латиничных вариантов нет, но есть арабские — сгенерим латин-кандидаты
+        if (
+          byRegex < 1 &&
+          byExactAny < 1 &&
+          words.length === 0 &&
+          ENABLE_AR_TO_LATIN_FALLBACK
+        ) {
+          const arVariants = (
+            variants as any as Array<{ script: string; textNorm: string }>
+          ).filter((v) => v.script === "AR" && v.textNorm);
+          const latinCands = arVariants.flatMap((v) =>
+            generateLatinCandidatesFromArabic(v.textNorm)
+          );
+          if (latinCands.length) {
+            const byExactFromAr = countExactFromCandidates(asrText, latinCands);
+            if (byExactFromAr > 0) {
+              byExactAny = byExactFromAr;
+              console.log("[count.by] exact.from.AR.candidates =", byExactAny);
+            }
+          }
+        }
+
+        let byStrong = 0;
+        if (byRegex < 1 && byExactAny < 1) {
+          byStrong = countByStrongPatterns(asrText, variants as any);
+          console.log("[count.by] strongPatterns =", byStrong);
+        }
+
+        repeatsNum = Math.max(byRegex, byExactAny, byStrong);
+
+        if (
+          repeatsNum > 1 &&
+          words.length === 0 &&
+          byRegex === 0 &&
+          byExactAny === 0
+        ) {
+          const cap = Math.max(1, STRONG_PATTERNS_SINGLE_MAX);
+          console.log(
+            "[strong.cap] words=0 & regex=0 & exactAny=0 => cap =",
+            cap
+          );
+          repeatsNum = Math.min(repeatsNum, cap);
+        }
+      }
+
+      if (!Number.isFinite(repeatsNum) || repeatsNum < 1) {
+        if (
+          (!Number.isFinite(asrConf) || asrConf < confGate) &&
+          !allowLowConf
+        ) {
+          await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
+          await safeUnlink(filePath);
+          return;
+        }
+        await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
+        await safeUnlink(filePath);
+        return;
+      }
+
+      const minVariantTokens = Math.min(
+        ...variants.map((v) => tokenCount(v.textNorm || "") || 1)
+      );
+
+      const repeatsCapped = capByDurationTop(
+        repeatsNum,
+        DURATION_MS,
+        hasAR,
+        minVariantTokens
+      );
+      const repeats = Math.min(Number(repeatsCapped), HARD_CAP);
+
+      console.log("[repeats.final]", repeats, hasAR ? "(AR)" : "(LATIN)");
+
+      await finalizeSuccess(
+        repeats,
+        recordingId,
+        userId,
+        zikrId,
+        tz,
+        asrText,
+        m.score ?? 0.85
+      );
+      await safeUnlink(filePath);
+      return;
+    }
+
+    console.log("[race] fallback → sequential");
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // SEQUENTIAL FALLBACK (DTW → ASR)
+  // ──────────────────────────────────────────────────────────────────────────
+
   if (await hasLocalTemplates(TEMPLATES_ROOT_ABS, zikrId)) {
     try {
       const c = await dtwCount(zikrId, filePath);
       console.log("[count.by] dtw =", c);
-      if (c >= 1) {
-        const repeats = Math.min(c, HARD_CAP);
-        await finalizeSuccess(
-          repeats,
-          recordingId,
-          userId,
-          zikrId,
-          tz,
-          "",
-          0.95
-        );
-        await safeUnlink(filePath);
-        return;
+      if (c >= 1 && DURATION_MS >= DTW_MIN_DURATION_MS) {
+        // быстрая проверка sanity через ASR
+        let sanity: AsrResultShape | null = null;
+        try {
+          sanity = await withTimeout(
+            runASR(),
+            ASR_SANITY_TIMEOUT_MS,
+            "asr.sanity"
+          );
+        } catch (e) {
+          console.log(
+            "[dtw.seq.gate] asr.sanity timeout/error =>",
+            (e as Error).message
+          );
+        }
+        const sanityText = sanity?.text?.trim() || "";
+        const sanityWords = sanity?.words?.length ?? 0;
+        const sanityConf = Number(sanity?.conf ?? 0);
+
+        const phraseLatin = pickTopVariantByScript(variants as any, "LATINISH");
+        const phraseArabic = pickTopVariantByScript(variants as any, "AR");
+
+        let textSignals = 0;
+        if (sanityText) {
+          const exactAny = Math.max(
+            countExactPhraseRepeats(sanityText, phraseLatin),
+            countExactPhraseRepeats(sanityText, phraseArabic)
+          );
+          if (exactAny > 0) textSignals++;
+
+          const regexAny = countRepeatsRegex(
+            sanityText,
+            phraseArabic,
+            phraseLatin
+          );
+          if (regexAny > 0) textSignals++;
+
+          if (textSignals === 0) {
+            const strongAny = countByStrongPatterns(
+              sanityText,
+              variants as any
+            );
+            if (strongAny > 0) textSignals++;
+          }
+        }
+
+        const looksLikeZikr =
+          sanityWords >= 2 ||
+          textSignals > 0 ||
+          sanityConf >= ASR_SANITY_MIN_CONF;
+
+        if (looksLikeZikr) {
+          const repeats = Math.min(c, HARD_CAP);
+          console.log("[count.by] dtw (seq,gated) =", repeats, {
+            sanityWords,
+            textSignals,
+            sanityConf: +sanityConf.toFixed(3),
+          });
+          await finalizeSuccess(
+            repeats,
+            recordingId,
+            userId,
+            zikrId,
+            tz,
+            sanityText,
+            0.95
+          );
+          await safeUnlink(filePath);
+          return;
+        } else {
+          console.log("[dtw.seq.gate] rejected => continue with ASR", {
+            sanityWords,
+            textSignals,
+            sanityConf: +sanityConf.toFixed(3),
+          });
+        }
       }
     } catch (e) {
       console.log("[dtw.error]", (e as Error).message);
@@ -374,42 +946,45 @@ async function processJob(job: JobData) {
   }
 
   // 1) ASR + фоллбэки по тексту
-  const hasARvariant = variants.some((v) => (v.script as any) === "AR");
-  const preferAR =
+  const hasARvariant2 = variants.some((v) => v.script === "AR");
+  const preferAR2 =
     DEFAULT_PREFERRED_SCRIPT === "AR" ||
     userLevel === "ADVANCED" ||
     user?.language === "ar";
-  const langHint = preferAR && hasARvariant ? "ar" : "auto";
+  const langHint2 = preferAR2 && hasARvariant2 ? "ar" : "auto";
 
   let asrText = "";
   let asrConf = 0;
   let hasAR = false;
   let words: Array<{ w: string; start: number; end: number; p?: number }> = [];
+  let segments: string[] | undefined;
   try {
     const r: any = await (asr as any).transcribe(filePath, {
-      lang: langHint,
+      lang: langHint2,
       vadMinSilMs: ASR_VAD_MIN_SIL_MS,
     });
     asrText = (r.text || "").trim();
     asrConf = Number(r.conf || 0);
     hasAR = !!r.has_ar || hasArabicChars(asrText);
     words = Array.isArray(r.words) ? r.words : [];
+    segments = Array.isArray(r.segments) ? r.segments : undefined;
   } catch (e) {
     console.log("[asr.error]", (e as Error).message);
   }
   console.log("[asr]", {
     text: asrText,
     conf: asrConf,
-    langHint,
+    langHint: langHint2,
     has_ar: hasAR,
     words: words.length,
+    segments: Array.isArray(segments) ? segments.length : 0,
   });
 
   const normText = normalizeText(asrText);
   const m = matchScore({ asrText, userLevel, variants: variants as any });
   console.log("[match]", m);
 
-  const phraseLatin = pickTopVariantByScript(variants as any, "LATIN");
+  const phraseLatin = pickTopVariantByScript(variants as any, "LATINISH");
   const phraseArabic = pickTopVariantByScript(variants as any, "AR");
   const confGate = hasAR ? MIN_CONF_AR : MIN_CONF_LATIN;
   const allowLowConf = m?.ok && (m?.score ?? 0) >= 1.0;
@@ -420,7 +995,13 @@ async function processJob(job: JobData) {
   const exactLatin = countExactPhraseRepeats(asrText, phraseLatin);
   const exactArabic = countExactPhraseRepeats(asrText, phraseArabic);
   const exactBest = Math.max(exactLatin, exactArabic);
-  if (exactBest > 0) {
+
+  // ⬅️ NEW: считаем по сегментам
+  const segRepeats2 = countFromSegments(segments, phraseArabic, phraseLatin);
+  if (segRepeats2 > 0) {
+    repeatsNum = segRepeats2;
+    console.log("[count.by] segments =", repeatsNum);
+  } else if (exactBest > 0) {
     repeatsNum = exactBest;
     console.log("[count.by] exactPhrase =", repeatsNum);
   } else if (
@@ -436,23 +1017,68 @@ async function processJob(job: JobData) {
     repeatsNum = intervals.length;
     console.log("[count.by] words =", repeatsNum);
   } else if (normText && normText.length >= MIN_ASR_LEN) {
-    repeatsNum = countRepeatsRegex(asrText, phraseArabic, phraseLatin);
-    console.log("[count.by] regex =", repeatsNum);
-    if (repeatsNum < 1) {
-      const r2 = countByStrongPatterns(asrText, variants as any);
-      if (r2 > 0) {
-        repeatsNum = r2;
-        console.log("[count.by] strongPatterns =", repeatsNum);
+    let byRegex = countRepeatsRegex(asrText, phraseArabic, phraseLatin);
+    console.log("[count.by] regex =", byRegex);
+
+    // 1) exact по всем LATIN/RU вариантам
+    let byExactAny = 0;
+    if (byRegex < 1 && words.length === 0) {
+      byExactAny = countExactFromVariants(asrText, variants as any);
+      if (byExactAny > 0) {
+        console.log("[count.by] exact.any.variants =", byExactAny);
       }
+    }
+
+    // 2) exact по латин-кандидатам из арабских вариантов (если латиницы в БД нет)
+    if (
+      byRegex < 1 &&
+      byExactAny < 1 &&
+      words.length === 0 &&
+      ENABLE_AR_TO_LATIN_FALLBACK
+    ) {
+      const arVariants = (
+        variants as any as Array<{ script: string; textNorm: string }>
+      ).filter((v) => v.script === "AR" && v.textNorm);
+      const latinCands = arVariants.flatMap((v) =>
+        generateLatinCandidatesFromArabic(v.textNorm)
+      );
+      if (latinCands.length) {
+        const byExactFromAr = countExactFromCandidates(asrText, latinCands);
+        if (byExactFromAr > 0) {
+          byExactAny = byExactFromAr;
+          console.log("[count.by] exact.from.AR.candidates =", byExactAny);
+        }
+      }
+    }
+
+    let byStrong = 0;
+    if (byRegex < 1 && byExactAny < 1) {
+      byStrong = countByStrongPatterns(asrText, variants as any);
+      console.log("[count.by] strongPatterns =", byStrong);
+    }
+
+    repeatsNum = Math.max(byRegex, byExactAny, byStrong);
+
+    if (
+      repeatsNum > 1 &&
+      words.length === 0 &&
+      byRegex === 0 &&
+      byExactAny === 0
+    ) {
+      const cap = Math.max(1, STRONG_PATTERNS_SINGLE_MAX);
+      console.log("[strong.cap] words=0 & regex=0 & exactAny=0 => cap =", cap);
+      repeatsNum = Math.min(repeatsNum, cap);
     }
   }
 
   if (!Number.isFinite(repeatsNum) || repeatsNum < 1) {
     if ((!Number.isFinite(asrConf) || asrConf < confGate) && !allowLowConf) {
       await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
+      await safeUnlink(filePath);
       return;
     }
     await fail(recordingId, "no-full-phrase", asrText, m.score ?? 0.2);
+    await safeUnlink(filePath);
     return;
   }
 
